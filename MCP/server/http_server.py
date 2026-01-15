@@ -532,6 +532,532 @@ async def mcp_delete_endpoint(
     return Response(status_code=204)
 
 
+# === Memory Viewer Dashboard ===
+
+@app.get("/memories", response_class=HTMLResponse)
+async def memory_viewer():
+    """Memory Viewer Dashboard - View all stored memories"""
+    s3_ok, _ = vector_store.test_connection()
+    stats = vector_store.get_stats()
+    entry_count = stats.get("entry_count", 0)
+
+    # Get all entries for display
+    try:
+        entries = await vector_store.get_all_entries()
+        entries_data = [
+            {
+                "content": e.lossless_restatement,
+                "timestamp": e.timestamp,
+                "location": e.location or "—",
+                "persons": ", ".join(e.persons) if e.persons else "—",
+                "entities": ", ".join(e.entities) if e.entities else "—",
+                "topic": e.topic or "—",
+            }
+            for e in entries
+        ]
+    except Exception as ex:
+        entries_data = []
+        print(f"Error loading entries: {ex}")
+
+    # Build memory cards HTML
+    memory_cards = ""
+    for i, entry in enumerate(entries_data):
+        memory_cards += f'''
+        <div class="memory-card" data-index="{i}">
+            <div class="memory-content">{entry["content"]}</div>
+            <div class="memory-meta">
+                <div class="meta-row">
+                    <span class="meta-label">Timestamp:</span>
+                    <span class="meta-value">{entry["timestamp"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Persons:</span>
+                    <span class="meta-value tag-list">{entry["persons"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Location:</span>
+                    <span class="meta-value">{entry["location"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Entities:</span>
+                    <span class="meta-value">{entry["entities"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Topic:</span>
+                    <span class="meta-value topic">{entry["topic"]}</span>
+                </div>
+            </div>
+        </div>
+        '''
+
+    if not memory_cards:
+        memory_cards = '''
+        <div class="empty-state">
+            <div class="empty-icon">🧠</div>
+            <h3>No Memories Yet</h3>
+            <p>Start storing memories using the MCP tools:</p>
+            <code>memory_add(speaker="user", content="Your information here")</code>
+        </div>
+        '''
+
+    html = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SimpleMem - Memory Viewer</title>
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #e4e4e7;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 24px;
+            }}
+            header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 32px;
+                flex-wrap: wrap;
+                gap: 16px;
+            }}
+            .logo {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }}
+            .logo h1 {{
+                font-size: 28px;
+                font-weight: 700;
+                background: linear-gradient(135deg, #60a5fa, #a78bfa);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }}
+            .logo-icon {{
+                font-size: 32px;
+            }}
+            nav {{
+                display: flex;
+                gap: 12px;
+            }}
+            nav a {{
+                color: #a1a1aa;
+                text-decoration: none;
+                padding: 8px 16px;
+                border-radius: 8px;
+                transition: all 0.2s;
+            }}
+            nav a:hover, nav a.active {{
+                color: #fff;
+                background: rgba(255,255,255,0.1);
+            }}
+
+            /* Stats Bar */
+            .stats-bar {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 16px;
+                margin-bottom: 24px;
+            }}
+            .stat-card {{
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+                padding: 20px;
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 36px;
+                font-weight: 700;
+                background: linear-gradient(135deg, #60a5fa, #34d399);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }}
+            .stat-label {{
+                color: #a1a1aa;
+                font-size: 14px;
+                margin-top: 4px;
+            }}
+            .stat-card.status .stat-value {{
+                font-size: 18px;
+                background: none;
+                -webkit-text-fill-color: {"#22c55e" if s3_ok else "#ef4444"};
+            }}
+
+            /* Controls */
+            .controls {{
+                display: flex;
+                gap: 12px;
+                margin-bottom: 24px;
+                flex-wrap: wrap;
+            }}
+            .search-box {{
+                flex: 1;
+                min-width: 250px;
+                position: relative;
+            }}
+            .search-box input {{
+                width: 100%;
+                padding: 12px 16px 12px 44px;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 10px;
+                background: rgba(255,255,255,0.05);
+                color: #fff;
+                font-size: 15px;
+                transition: all 0.2s;
+            }}
+            .search-box input:focus {{
+                outline: none;
+                border-color: #60a5fa;
+                background: rgba(255,255,255,0.08);
+            }}
+            .search-box::before {{
+                content: "🔍";
+                position: absolute;
+                left: 14px;
+                top: 50%;
+                transform: translateY(-50%);
+                font-size: 16px;
+            }}
+            .btn {{
+                padding: 12px 20px;
+                border: none;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }}
+            .btn-primary {{
+                background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+                color: white;
+            }}
+            .btn-primary:hover {{
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+            }}
+            .btn-danger {{
+                background: rgba(239, 68, 68, 0.2);
+                color: #f87171;
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }}
+            .btn-danger:hover {{
+                background: rgba(239, 68, 68, 0.3);
+            }}
+
+            /* Memory Grid */
+            .memory-grid {{
+                display: grid;
+                gap: 16px;
+            }}
+            .memory-card {{
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 16px;
+                padding: 24px;
+                transition: all 0.3s;
+            }}
+            .memory-card:hover {{
+                background: rgba(255,255,255,0.06);
+                border-color: rgba(96, 165, 250, 0.3);
+                transform: translateY(-2px);
+            }}
+            .memory-content {{
+                font-size: 16px;
+                line-height: 1.6;
+                color: #f4f4f5;
+                margin-bottom: 16px;
+                padding-bottom: 16px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }}
+            .memory-meta {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 12px;
+            }}
+            .meta-row {{
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }}
+            .meta-label {{
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                color: #71717a;
+            }}
+            .meta-value {{
+                font-size: 14px;
+                color: #a1a1aa;
+            }}
+            .meta-value.tag-list {{
+                color: #60a5fa;
+            }}
+            .meta-value.topic {{
+                color: #a78bfa;
+            }}
+
+            /* Empty State */
+            .empty-state {{
+                text-align: center;
+                padding: 60px 20px;
+                background: rgba(255,255,255,0.02);
+                border: 2px dashed rgba(255,255,255,0.1);
+                border-radius: 16px;
+            }}
+            .empty-icon {{
+                font-size: 64px;
+                margin-bottom: 16px;
+            }}
+            .empty-state h3 {{
+                font-size: 24px;
+                margin-bottom: 8px;
+                color: #e4e4e7;
+            }}
+            .empty-state p {{
+                color: #71717a;
+                margin-bottom: 16px;
+            }}
+            .empty-state code {{
+                display: inline-block;
+                background: rgba(96, 165, 250, 0.1);
+                color: #60a5fa;
+                padding: 8px 16px;
+                border-radius: 8px;
+                font-size: 13px;
+            }}
+
+            /* Footer */
+            footer {{
+                margin-top: 48px;
+                padding-top: 24px;
+                border-top: 1px solid rgba(255,255,255,0.08);
+                text-align: center;
+                color: #52525b;
+                font-size: 13px;
+            }}
+            footer a {{
+                color: #60a5fa;
+                text-decoration: none;
+            }}
+
+            /* Modal */
+            .modal-overlay {{
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0,0,0,0.7);
+                z-index: 1000;
+                align-items: center;
+                justify-content: center;
+            }}
+            .modal-overlay.active {{
+                display: flex;
+            }}
+            .modal {{
+                background: #1e1e2e;
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 16px;
+                padding: 32px;
+                max-width: 400px;
+                text-align: center;
+            }}
+            .modal h3 {{
+                font-size: 20px;
+                margin-bottom: 12px;
+            }}
+            .modal p {{
+                color: #a1a1aa;
+                margin-bottom: 24px;
+            }}
+            .modal-buttons {{
+                display: flex;
+                gap: 12px;
+                justify-content: center;
+            }}
+
+            /* Responsive */
+            @media (max-width: 640px) {{
+                .container {{ padding: 16px; }}
+                header {{ flex-direction: column; align-items: flex-start; }}
+                .memory-meta {{ grid-template-columns: 1fr; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <div class="logo">
+                    <span class="logo-icon">🧠</span>
+                    <h1>SimpleMem</h1>
+                </div>
+                <nav>
+                    <a href="/">Status</a>
+                    <a href="/memories" class="active">Memories</a>
+                    <a href="/api/health">API Health</a>
+                </nav>
+            </header>
+
+            <div class="stats-bar">
+                <div class="stat-card">
+                    <div class="stat-value">{entry_count}</div>
+                    <div class="stat-label">Total Memories</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{settings.s3_bucket}</div>
+                    <div class="stat-label">S3 Bucket</div>
+                </div>
+                <div class="stat-card status">
+                    <div class="stat-value">{"● Connected" if s3_ok else "● Disconnected"}</div>
+                    <div class="stat-label">Storage Status</div>
+                </div>
+            </div>
+
+            <div class="controls">
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="Search memories..." onkeyup="filterMemories()">
+                </div>
+                <button class="btn btn-primary" onclick="location.reload()">
+                    ↻ Refresh
+                </button>
+                <button class="btn btn-danger" onclick="showClearModal()">
+                    🗑 Clear All
+                </button>
+            </div>
+
+            <div class="memory-grid" id="memoryGrid">
+                {memory_cards}
+            </div>
+
+            <footer>
+                <p>SimpleMem v1.0.0 · <a href="https://aiming-lab.github.io/SimpleMem-Page/" target="_blank">Documentation</a></p>
+            </footer>
+        </div>
+
+        <!-- Clear Confirmation Modal -->
+        <div class="modal-overlay" id="clearModal">
+            <div class="modal">
+                <h3>⚠️ Clear All Memories?</h3>
+                <p>This action cannot be undone. All {entry_count} memories will be permanently deleted.</p>
+                <div class="modal-buttons">
+                    <button class="btn btn-primary" onclick="hideClearModal()">Cancel</button>
+                    <button class="btn btn-danger" onclick="clearAllMemories()">Delete All</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            function filterMemories() {{
+                const query = document.getElementById('searchInput').value.toLowerCase();
+                const cards = document.querySelectorAll('.memory-card');
+
+                cards.forEach(card => {{
+                    const content = card.textContent.toLowerCase();
+                    card.style.display = content.includes(query) ? 'block' : 'none';
+                }});
+            }}
+
+            function showClearModal() {{
+                document.getElementById('clearModal').classList.add('active');
+            }}
+
+            function hideClearModal() {{
+                document.getElementById('clearModal').classList.remove('active');
+            }}
+
+            async function clearAllMemories() {{
+                try {{
+                    // Initialize session first
+                    const initRes = await fetch('/mcp', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        }},
+                        body: JSON.stringify({{
+                            jsonrpc: '2.0',
+                            method: 'initialize',
+                            id: 1,
+                            params: {{}}
+                        }})
+                    }});
+                    const sessionId = initRes.headers.get('Mcp-Session-Id');
+
+                    // Call clear tool
+                    await fetch('/mcp', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'Mcp-Session-Id': sessionId
+                        }},
+                        body: JSON.stringify({{
+                            jsonrpc: '2.0',
+                            method: 'tools/call',
+                            id: 2,
+                            params: {{
+                                name: 'memory_clear',
+                                arguments: {{}}
+                            }}
+                        }})
+                    }});
+
+                    location.reload();
+                }} catch (err) {{
+                    alert('Error clearing memories: ' + err.message);
+                }}
+            }}
+
+            // Close modal on escape key
+            document.addEventListener('keydown', (e) => {{
+                if (e.key === 'Escape') hideClearModal();
+            }});
+        </script>
+    </body>
+    </html>
+    '''
+    return HTMLResponse(content=html)
+
+
+# === API Endpoint for Memory Data (JSON) ===
+
+@app.get("/api/memories")
+async def get_memories_api():
+    """Get all memories as JSON for programmatic access"""
+    try:
+        entries = await vector_store.get_all_entries()
+        return {
+            "success": True,
+            "count": len(entries),
+            "memories": [
+                {
+                    "content": e.lossless_restatement,
+                    "timestamp": e.timestamp,
+                    "location": e.location,
+                    "persons": e.persons,
+                    "entities": e.entities,
+                    "topic": e.topic,
+                }
+                for e in entries
+            ]
+        }
+    except Exception as ex:
+        return {"success": False, "error": str(ex), "memories": []}
+
+
 # === Root Endpoint (Single-Tenant Status Page) ===
 
 @app.get("/", response_class=HTMLResponse)
