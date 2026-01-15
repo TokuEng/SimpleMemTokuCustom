@@ -182,21 +182,22 @@ class MCPHandler:
             },
             "instructions": """SimpleMem provides persistent long-term memory across sessions.
 
-WHEN TO USE (automatically trigger these tools):
-- User says "remember", "save", "store", "note", "don't forget" → USE memory_add
-- User asks about past conversations, preferences, history → USE memory_query
-- User asks "what do you know about me", "what did I say" → USE memory_query
-- User wants to see stored information → USE memory_retrieve
-- User asks about memory status → USE memory_stats
+USE THE TOOLS (not resources) for all operations:
 
-TOOLS:
-- memory_add: Store a fact/preference/information (speaker + content)
-- memory_query: Ask questions about stored memories (returns AI-synthesized answer)
-- memory_retrieve: Get raw memory entries with metadata
-- memory_stats: Check how many memories are stored
-- memory_clear: Delete all memories (use with caution)
+WHEN TO CALL TOOLS:
+- User says "remember", "save", "store", "note" → CALL TOOL: memory_add(speaker="user", content="the information")
+- User asks about past info, preferences, history → CALL TOOL: memory_query(question="...")
+- User wants to see raw stored data → CALL TOOL: memory_retrieve(query="...")
+- User asks about memory status → CALL TOOL: memory_stats()
 
-IMPORTANT: When users share preferences, facts about themselves, or ask you to remember something, ALWAYS use memory_add to persist it. Don't just acknowledge - actually store it.""",
+AVAILABLE TOOLS (call these, not resources):
+- memory_add(speaker, content): Store information. Example: memory_add(speaker="user", content="My favorite color is blue")
+- memory_query(question): Ask questions about memories. Returns AI answer.
+- memory_retrieve(query): Get raw memory entries with metadata.
+- memory_stats(): Get memory count and status.
+- memory_clear(): Delete all memories (careful!).
+
+IMPORTANT: These are TOOLS, not resources. Call them as tool invocations, not resource reads.""",
         }
 
     async def _handle_initialized(self, params: dict) -> dict:
