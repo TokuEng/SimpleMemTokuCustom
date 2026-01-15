@@ -180,22 +180,23 @@ class MCPHandler:
                               "and intelligent query planning with reflection. "
                               "Single-tenant mode with S3 storage.",
             },
-            "instructions": """SimpleMem is your long-term memory system. Use it to:
+            "instructions": """SimpleMem provides persistent long-term memory across sessions.
 
-1. STORE conversations: Use memory_add or memory_add_batch to save dialogues.
-   The system automatically extracts facts, resolves pronouns, and anchors timestamps.
-   Memories are stored immediately - no manual flush needed.
+WHEN TO USE (automatically trigger these tools):
+- User says "remember", "save", "store", "note", "don't forget" → USE memory_add
+- User asks about past conversations, preferences, history → USE memory_query
+- User asks "what do you know about me", "what did I say" → USE memory_query
+- User wants to see stored information → USE memory_retrieve
+- User asks about memory status → USE memory_stats
 
-2. RECALL information: Use memory_query to ask questions about past conversations.
-   The system retrieves relevant memories and synthesizes answers.
+TOOLS:
+- memory_add: Store a fact/preference/information (speaker + content)
+- memory_query: Ask questions about stored memories (returns AI-synthesized answer)
+- memory_retrieve: Get raw memory entries with metadata
+- memory_stats: Check how many memories are stored
+- memory_clear: Delete all memories (use with caution)
 
-3. BROWSE memories: Use memory_retrieve to see raw stored facts with metadata.
-
-4. MANAGE: Use memory_stats to check status, memory_clear to reset (careful!).
-
-Tips:
-- Use memory_query for natural questions, memory_retrieve for browsing
-- Each memory_add call processes and stores data immediately""",
+IMPORTANT: When users share preferences, facts about themselves, or ask you to remember something, ALWAYS use memory_add to persist it. Don't just acknowledge - actually store it.""",
         }
 
     async def _handle_initialized(self, params: dict) -> dict:
