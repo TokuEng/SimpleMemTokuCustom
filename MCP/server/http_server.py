@@ -388,20 +388,17 @@ async def mcp_post_endpoint(
             headers={"Mcp-Session-Id": session.session_id},
         )
 
-    # For non-initialization requests, session ID is required
-    if not mcp_session_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Mcp-Session-Id header required for non-initialization requests",
-        )
+    # For non-initialization requests, try to get existing session or create new one
+    session = None
+    if mcp_session_id:
+        session = await get_session(mcp_session_id)
 
-    # Get existing session
-    session = await get_session(mcp_session_id)
+    # Auto-create session if not found (resilient mode)
+    # This handles cases where session expired or server restarted
     if not session:
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found or expired. Send new InitializeRequest.",
-        )
+        session = await get_or_create_session()
+        session.initialized = True  # Mark as initialized since client already initialized
+        print(f"Auto-created new session {session.session_id} (previous: {mcp_session_id or 'none'})")
 
     # If only notifications or responses, return 202 Accepted
     if _is_notification_or_response_only(data):
