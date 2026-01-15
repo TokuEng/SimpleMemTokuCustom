@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
 from .auth.token_manager import SimpleAuthManager
@@ -536,21 +535,49 @@ async def mcp_delete_endpoint(
     return Response(status_code=204)
 
 
-# === Static Files (Frontend) ===
-
-frontend_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
-if os.path.exists(frontend_path):
-    app.mount("/static", StaticFiles(directory=frontend_path), name="static")
-
+# === Root Endpoint (Single-Tenant Status Page) ===
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
-    """Serve frontend HTML"""
-    index_path = os.path.join(frontend_path, "index.html")
-    if os.path.exists(index_path):
-        with open(index_path, "r") as f:
-            return HTMLResponse(content=f.read())
-    return HTMLResponse(content="<h1>SimpleMem MCP Server</h1><p>Single-tenant mode with S3 storage.</p>")
+async def root_status():
+    """Show server status page (single-tenant mode)"""
+    s3_ok, _ = vector_store.test_connection()
+    status_color = "#22c55e" if s3_ok else "#ef4444"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>SimpleMem MCP Server</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }}
+            h1 {{ color: #1f2937; }}
+            .status {{ display: inline-block; padding: 4px 12px; border-radius: 4px; background: {status_color}; color: white; }}
+            .info {{ background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0; }}
+            code {{ background: #e5e7eb; padding: 2px 6px; border-radius: 4px; }}
+        </style>
+    </head>
+    <body>
+        <h1>SimpleMem MCP Server</h1>
+        <p>Efficient Lifelong Memory for LLM Agents</p>
+        <p>Status: <span class="status">{"Running" if s3_ok else "Degraded"}</span></p>
+
+        <div class="info">
+            <p><strong>Mode:</strong> Single-Tenant</p>
+            <p><strong>Storage:</strong> S3 ({settings.s3_bucket})</p>
+            <p><strong>Auth:</strong> {"Enabled" if auth_manager.auth_enabled else "Disabled"}</p>
+            <p><strong>MCP Endpoint:</strong> <code>POST /mcp</code></p>
+        </div>
+
+        <h3>Quick Test</h3>
+        <pre style="background: #1f2937; color: #f3f4f6; padding: 15px; border-radius: 8px; overflow-x: auto;">
+curl -X POST {settings.s3_endpoint.replace('digitaloceanspaces.com', 'ondigitalocean.app')}/mcp \\
+  -H "Content-Type: application/json" \\
+  -H "Accept: application/json" \\
+  -d '{{"jsonrpc":"2.0","method":"initialize","id":1,"params":{{}}}}'</pre>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
 # === Entry Point ===
