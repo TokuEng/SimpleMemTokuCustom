@@ -1,6 +1,5 @@
 """Database modules for SimpleMem"""
 
-from .vector_store import MultiTenantVectorStore
-from .user_store import UserStore
+from .vector_store import SingleTenantVectorStore
 
-__all__ = ["MultiTenantVectorStore", "UserStore"]
+__all__ = ["SingleTenantVectorStore"]
