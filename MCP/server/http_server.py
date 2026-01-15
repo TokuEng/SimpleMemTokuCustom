@@ -538,12 +538,12 @@ async def mcp_delete_endpoint(
 async def memory_viewer():
     """Memory Viewer Dashboard - View all stored memories"""
     s3_ok, _ = vector_store.test_connection()
-    stats = vector_store.get_stats()
-    entry_count = stats.get("entry_count", 0)
 
-    # Get all entries for display
+    # Get all entries for display (this is the source of truth)
     try:
         entries = await vector_store.get_all_entries()
+        # Use actual entries count, not cached stats
+        entry_count = len(entries)
         entries_data = [
             {
                 "content": e.lossless_restatement,
@@ -557,6 +557,7 @@ async def memory_viewer():
         ]
     except Exception as ex:
         entries_data = []
+        entry_count = 0
         print(f"Error loading entries: {ex}")
 
     # Build memory cards HTML
