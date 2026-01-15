@@ -92,11 +92,15 @@ vector_store = SingleTenantVectorStore(
 # Simple auth manager
 auth_manager = SimpleAuthManager(settings.simplemem_access_key)
 
+# Single global MCP handler (initialized at module load for thread safety)
+mcp_handler = MCPHandler(
+    openrouter_client=openrouter_client,
+    vector_store=vector_store,
+    settings=settings,
+)
+
 # Store active sessions by session_id
 _sessions: dict[str, MCPSession] = {}
-
-# Single global MCP handler
-_mcp_handler: Optional[MCPHandler] = None
 
 # Lock for session operations
 _session_lock = asyncio.Lock()
@@ -130,18 +134,6 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _get_mcp_handler() -> MCPHandler:
-    """Get or create the global MCP handler"""
-    global _mcp_handler
-    if _mcp_handler is None:
-        _mcp_handler = MCPHandler(
-            openrouter_client=openrouter_client,
-            vector_store=vector_store,
-            settings=settings,
-        )
-    return _mcp_handler
-
-
 async def get_or_create_session(session_id: Optional[str] = None) -> MCPSession:
     """Get existing session or create new one (single-tenant)"""
     async with _session_lock:
@@ -152,10 +144,9 @@ async def get_or_create_session(session_id: Optional[str] = None) -> MCPSession:
 
         # Create new session with shared handler
         new_session_id = generate_session_id()
-        handler = _get_mcp_handler()
         session = MCPSession(
             session_id=new_session_id,
-            handler=handler,
+            handler=mcp_handler,
         )
         _sessions[new_session_id] = session
         return session

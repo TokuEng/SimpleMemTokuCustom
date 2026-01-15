@@ -83,7 +83,8 @@ def main():
         port=args.port,
         reload=args.reload,
     )
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(main())

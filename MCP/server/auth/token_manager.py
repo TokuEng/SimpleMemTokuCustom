@@ -5,6 +5,7 @@ Validates bearer tokens against the SIMPLEMEM_ACCESS_KEY environment variable.
 If no access key is set, authentication is disabled and all requests are allowed.
 """
 
+import secrets
 from typing import Optional, Tuple
 
 
@@ -43,7 +44,8 @@ class SimpleAuthManager:
         if not token:
             return False, "Missing access token"
 
-        if token == self.access_key:
+        # Use constant-time comparison to prevent timing attacks
+        if secrets.compare_digest(token, self.access_key):
             return True, None
 
         return False, "Invalid access token"
