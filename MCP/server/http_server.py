@@ -1,15 +1,15 @@
 """
-HTTP Server for SimpleMem MCP
+HTTP Server for SimpleMem MCP - Single Tenant Mode
 
 Provides:
-- User registration and authentication (/api/auth/*)
 - MCP over Streamable HTTP (2025-03-26 spec) (/mcp)
-- Legacy MCP over SSE for backwards compatibility (/mcp/sse)
+- Health and info endpoints (/api/*)
 - Static frontend for configuration (/)
+- S3-backed LanceDB storage
 
 Streamable HTTP Transport:
 - Single endpoint /mcp supporting POST, GET, DELETE
-- Authentication via Authorization: Bearer <token> header
+- Optional authentication via Authorization: Bearer <token> header
 - Session management via Mcp-Session-Id header
 - Supports both JSON and SSE response formats
 """
@@ -17,24 +17,20 @@ Streamable HTTP Transport:
 import asyncio
 import json
 import os
-import uuid
 import secrets
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header, Response
+from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
 
-from .auth.token_manager import TokenManager
-from .auth.models import User
-from .database.user_store import UserStore
-from .database.vector_store import MultiTenantVectorStore
-from .integrations.openrouter import OpenRouterClient, OpenRouterClientManager
+from .auth.token_manager import SimpleAuthManager
+from .database.vector_store import SingleTenantVectorStore
+from .integrations.openrouter import OpenRouterClient
 from .mcp_handler import MCPHandler
 
 import sys
@@ -42,29 +38,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import get_settings
 
 
-# === Pydantic Models ===
-
-class RegisterRequest(BaseModel):
-    openrouter_api_key: str
-
-
-class RegisterResponse(BaseModel):
-    success: bool
-    token: Optional[str] = None
-    user_id: Optional[str] = None
-    mcp_endpoint: Optional[str] = None
-    error: Optional[str] = None
-
-
 # === Session Management ===
 
 @dataclass
 class MCPSession:
-    """Represents an active MCP session"""
+    """Represents an active MCP session (single-tenant)"""
     session_id: str
-    user_id: str
-    user: User
-    api_key: str
     handler: MCPHandler
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_active: datetime = field(default_factory=datetime.utcnow)
@@ -93,24 +72,31 @@ SESSION_EXPIRY_MINUTES = 30
 # === Global Instances ===
 
 settings = get_settings()
-user_store = UserStore(settings.user_db_path)
-vector_store = MultiTenantVectorStore(settings.lancedb_path, settings.embedding_dimension)
-token_manager = TokenManager(
-    secret_key=settings.jwt_secret_key,
-    encryption_key=settings.encryption_key,
-    expiration_days=settings.jwt_expiration_days,
-)
-client_manager = OpenRouterClientManager(
+
+# Single OpenRouter client using server-side API key
+openrouter_client = OpenRouterClient(
+    api_key=settings.openrouter_api_key,
     base_url=settings.openrouter_base_url,
     llm_model=settings.llm_model,
     embedding_model=settings.embedding_model,
 )
 
-# Store active MCP handlers per user (legacy)
-_mcp_handlers: dict[str, MCPHandler] = {}
+# Single vector store with S3 backend
+vector_store = SingleTenantVectorStore(
+    s3_path=settings.lancedb_path,
+    storage_options=settings.get_s3_storage_options(),
+    table_name=settings.table_name,
+    embedding_dimension=settings.embedding_dimension,
+)
+
+# Simple auth manager
+auth_manager = SimpleAuthManager(settings.simplemem_access_key)
 
 # Store active sessions by session_id
 _sessions: dict[str, MCPSession] = {}
+
+# Single global MCP handler
+_mcp_handler: Optional[MCPHandler] = None
 
 # Lock for session operations
 _session_lock = asyncio.Lock()
@@ -144,28 +130,31 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def get_or_create_session(user: User, api_key: str, session_id: Optional[str] = None) -> MCPSession:
-    """Get existing session or create new one"""
+def _get_mcp_handler() -> MCPHandler:
+    """Get or create the global MCP handler"""
+    global _mcp_handler
+    if _mcp_handler is None:
+        _mcp_handler = MCPHandler(
+            openrouter_client=openrouter_client,
+            vector_store=vector_store,
+            settings=settings,
+        )
+    return _mcp_handler
+
+
+async def get_or_create_session(session_id: Optional[str] = None) -> MCPSession:
+    """Get existing session or create new one (single-tenant)"""
     async with _session_lock:
         if session_id and session_id in _sessions:
             session = _sessions[session_id]
             session.touch()
             return session
 
-        # Create new session
+        # Create new session with shared handler
         new_session_id = generate_session_id()
-        handler = MCPHandler(
-            user=user,
-            api_key=api_key,
-            vector_store=vector_store,
-            client_manager=client_manager,
-            settings=settings,
-        )
+        handler = _get_mcp_handler()
         session = MCPSession(
             session_id=new_session_id,
-            user_id=user.user_id,
-            user=user,
-            api_key=api_key,
             handler=handler,
         )
         _sessions[new_session_id] = session
@@ -192,12 +181,15 @@ async def delete_session(session_id: str) -> bool:
 
 # === Authentication Helper ===
 
-async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
+async def verify_bearer_token(authorization: Optional[str]) -> bool:
     """
-    Verify Bearer token from Authorization header.
-    Returns (user, api_key) tuple.
+    Verify Bearer token for single-tenant mode.
+    Returns True if valid or auth disabled.
     Raises HTTPException on failure.
     """
+    if not auth_manager.auth_enabled:
+        return True
+
     if not authorization:
         raise HTTPException(
             status_code=401,
@@ -214,20 +206,15 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
         )
 
     token = parts[1]
-    is_valid, payload, error = token_manager.verify_token(token)
+    is_valid, error = auth_manager.verify_token(token)
     if not is_valid:
         raise HTTPException(
             status_code=401,
-            detail=f"Invalid token: {error}",
+            detail=error,
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-    return user, api_key
+    return True
 
 
 # === Lifecycle ===
@@ -235,11 +222,23 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for the app"""
-    print("SimpleMem MCP Server started")
-    print(f"  - LLM Model: {settings.llm_model}")
-    print(f"  - Embedding Model: {settings.embedding_model}")
-    print(f"  - Window Size: {settings.window_size}")
-    print(f"  - Transport: Streamable HTTP (2025-03-26)")
+    print("=" * 60)
+    print("  SimpleMem MCP Server (Single-Tenant)")
+    print("  S3-backed Memory Service for LLM Agents")
+    print("=" * 60)
+    print()
+    print(f"  LLM Model: {settings.llm_model}")
+    print(f"  Embedding Model: {settings.embedding_model}")
+    print(f"  S3 Bucket: {settings.s3_bucket}")
+    print(f"  Auth: {'Enabled' if auth_manager.auth_enabled else 'Disabled'}")
+    print(f"  Transport: Streamable HTTP (2025-03-26)")
+    print()
+
+    # Test S3 connection
+    s3_ok, s3_msg = vector_store.test_connection()
+    print(f"  S3 Connection: {s3_msg}")
+    print()
+    print("-" * 60)
 
     # Start session cleanup task
     cleanup_task = asyncio.create_task(session_cleanup_task())
@@ -253,6 +252,9 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Close OpenRouter client
+    await openrouter_client.close()
+
     print("SimpleMem MCP Server stopped")
 
 
@@ -260,7 +262,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SimpleMem MCP Server",
-    description="Multi-tenant Memory Service for LLM Agents",
+    description="Single-Tenant Memory Service for LLM Agents with S3 Storage",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -274,100 +276,18 @@ app.add_middleware(
 )
 
 
-# === Authentication Endpoints ===
-
-@app.post("/api/auth/register", response_model=RegisterResponse)
-async def register(request: RegisterRequest):
-    """Register a new user with OpenRouter API key"""
-    try:
-        # Validate API key with OpenRouter
-        client = OpenRouterClient(
-            api_key=request.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-        )
-        is_valid, error = await client.verify_api_key()
-        await client.close()
-
-        if not is_valid:
-            return RegisterResponse(
-                success=False,
-                error=f"Invalid OpenRouter API key: {error}",
-            )
-
-        # Create user
-        user = User()
-        user.openrouter_api_key_encrypted = token_manager.encrypt_api_key(
-            request.openrouter_api_key
-        )
-
-        # Save user
-        user_store.create_user(user)
-
-        # Generate token
-        token = token_manager.generate_token(user)
-
-        # Base URL for MCP endpoint (can be overridden via env)
-        base_url = os.getenv("MCP_BASE_URL", "")
-        mcp_endpoint = f"{base_url}/mcp" if base_url else "/mcp"
-
-        return RegisterResponse(
-            success=True,
-            token=token,
-            user_id=user.user_id,
-            mcp_endpoint=mcp_endpoint,  # Streamable HTTP endpoint
-        )
-
-    except Exception as e:
-        return RegisterResponse(
-            success=False,
-            error=str(e),
-        )
-
-
-@app.get("/api/auth/verify")
-async def verify_token(token: str = Query(..., description="Token to verify")):
-    """Verify token is valid"""
-    is_valid, payload, error = token_manager.verify_token(token)
-    if not is_valid:
-        raise HTTPException(status_code=401, detail=error)
-
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return {
-        "valid": True,
-        "user_id": user.user_id,
-    }
-
-
-@app.post("/api/auth/refresh")
-async def refresh_token(token: str = Query(..., description="Token to refresh")):
-    """Refresh authentication token"""
-    is_valid, payload, error = token_manager.verify_token(token)
-    if not is_valid:
-        raise HTTPException(status_code=401, detail=error)
-
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    new_token = token_manager.generate_token(user)
-    return {
-        "success": True,
-        "token": new_token,
-    }
-
-
 # === Health & Info ===
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with S3 connectivity test"""
+    s3_ok, s3_msg = vector_store.test_connection()
+
     return {
-        "status": "healthy",
+        "status": "healthy" if s3_ok else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
+        "s3_storage": "connected" if s3_ok else f"error: {s3_msg}",
     }
 
 
@@ -377,30 +297,19 @@ async def server_info():
     return {
         "name": "SimpleMem MCP Server",
         "version": "1.0.0",
+        "mode": "single-tenant",
         "protocol_version": "2025-03-26",
         "transport": "Streamable HTTP",
+        "storage": "S3",
+        "s3_bucket": settings.s3_bucket,
         "llm_model": settings.llm_model,
         "embedding_model": settings.embedding_model,
-        "window_size": settings.window_size,
+        "auth_enabled": auth_manager.auth_enabled,
         "active_sessions": len(_sessions),
-        "total_users": user_store.count_users(),
     }
 
 
-# === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===
-
-def _get_mcp_handler(user: User, api_key: str) -> MCPHandler:
-    """Get or create MCP handler for user (legacy)"""
-    if user.user_id not in _mcp_handlers:
-        _mcp_handlers[user.user_id] = MCPHandler(
-            user=user,
-            api_key=api_key,
-            vector_store=vector_store,
-            client_manager=client_manager,
-            settings=settings,
-        )
-    return _mcp_handlers[user.user_id]
-
+# === MCP Protocol Helper Functions ===
 
 def _is_initialize_request(data: dict | list) -> bool:
     """Check if the message is an initialize request"""
@@ -426,6 +335,8 @@ def _is_notification_or_response_only(data: dict | list) -> bool:
     return True
 
 
+# === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===
+
 @app.post("/mcp")
 async def mcp_post_endpoint(
     request: Request,
@@ -438,7 +349,7 @@ async def mcp_post_endpoint(
     Handles JSON-RPC 2.0 messages from clients.
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Accept: application/json, text/event-stream (required)
     - Mcp-Session-Id: <session-id> (required after initialization)
 
@@ -457,8 +368,7 @@ async def mcp_post_endpoint(
         )
 
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
-    user_store.update_last_active(user.user_id)
+    await verify_bearer_token(authorization)
 
     # Parse request body
     try:
@@ -475,7 +385,7 @@ async def mcp_post_endpoint(
 
     # Handle initialization (creates new session)
     if _is_initialize_request(data):
-        session = await get_or_create_session(user, api_key)
+        session = await get_or_create_session()
         session.initialized = True
 
         # Process the initialize request
@@ -503,10 +413,6 @@ async def mcp_post_endpoint(
             detail="Session not found or expired. Send new InitializeRequest.",
         )
 
-    # Verify session belongs to this user
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
-
     # If only notifications or responses, return 202 Accepted
     if _is_notification_or_response_only(data):
         # Still process them (e.g., initialized notification)
@@ -514,7 +420,6 @@ async def mcp_post_endpoint(
         return Response(status_code=202)
 
     # Process request(s) and return response
-    # For now, we return JSON. SSE streaming can be added for long-running tools.
     response_str = await session.handler.handle_message(json.dumps(data))
     response_data = json.loads(response_str)
 
@@ -537,7 +442,7 @@ async def mcp_get_endpoint(
     Used for server-initiated messages (notifications, requests to client).
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Accept: text/event-stream (required)
     - Mcp-Session-Id: <session-id> (required)
     - Last-Event-ID: <event-id> (optional, for resumability)
@@ -551,7 +456,7 @@ async def mcp_get_endpoint(
         )
 
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
+    await verify_bearer_token(authorization)
 
     # Session ID required for GET
     if not mcp_session_id:
@@ -567,10 +472,6 @@ async def mcp_get_endpoint(
             status_code=404,
             detail="Session not found or expired",
         )
-
-    # Verify session belongs to this user
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
 
     # Generate unique stream ID
     stream_id = secrets.token_urlsafe(16)
@@ -625,148 +526,23 @@ async def mcp_delete_endpoint(
     Terminate an MCP session.
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Mcp-Session-Id: <session-id> (required)
     """
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
+    await verify_bearer_token(authorization)
 
     if not mcp_session_id:
         raise HTTPException(status_code=400, detail="Mcp-Session-Id header required")
 
-    # Get session to verify ownership
+    # Get session to verify it exists
     session = await get_session(mcp_session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
-
     # Delete session
     await delete_session(mcp_session_id)
     return Response(status_code=204)
-
-
-# === Legacy MCP Endpoints (HTTP+SSE - 2024-11-05 spec) ===
-# Kept for backwards compatibility with older clients
-
-@app.get("/mcp/sse")
-async def mcp_sse_endpoint_legacy(
-    request: Request,
-    token: Optional[str] = Query(None, description="Authentication token (legacy)"),
-    authorization: Optional[str] = Header(None),
-):
-    """
-    Legacy MCP over Server-Sent Events (SSE) endpoint.
-
-    DEPRECATED: Use Streamable HTTP at /mcp instead.
-
-    Supports both:
-    - Query param: ?token=<token> (legacy)
-    - Header: Authorization: Bearer <token> (preferred)
-    """
-    # Try to get token from header first, then query param
-    if authorization:
-        user, api_key = await verify_bearer_token(authorization)
-    elif token:
-        is_valid, payload, error = token_manager.verify_token(token)
-        if not is_valid:
-            raise HTTPException(status_code=401, detail=error)
-        user = user_store.get_user(payload.user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-    else:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    # Create session for legacy client
-    session = await get_or_create_session(user, api_key)
-
-    # Get base URL
-    base_url = os.getenv("MCP_BASE_URL", "")
-    message_endpoint = f"{base_url}/mcp/message" if base_url else "/mcp/message"
-
-    async def event_generator():
-        """Generate SSE events"""
-        # Send endpoint info as first event (legacy format)
-        endpoint_url = f"{message_endpoint}?session_id={session.session_id}"
-        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
-
-        # Send initial keepalive
-        yield ": keepalive\n\n"
-
-        # Keep connection alive
-        while True:
-            await asyncio.sleep(15)
-            yield ": keepalive\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
-
-@app.post("/mcp/message")
-async def mcp_message_endpoint_legacy(
-    request: Request,
-    session_id: Optional[str] = Query(None, description="Session ID"),
-    token: Optional[str] = Query(None, description="Authentication token (legacy)"),
-    authorization: Optional[str] = Header(None),
-    mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
-):
-    """
-    Legacy MCP message endpoint.
-
-    DEPRECATED: Use Streamable HTTP POST to /mcp instead.
-
-    Supports both legacy and new authentication methods.
-    """
-    # Get session ID from header or query param
-    sid = mcp_session_id or session_id
-
-    # Try to authenticate and get session
-    if authorization:
-        user, api_key = await verify_bearer_token(authorization)
-        if sid:
-            session = await get_session(sid)
-            if session and session.user_id == user.user_id:
-                handler = session.handler
-            else:
-                handler = _get_mcp_handler(user, api_key)
-        else:
-            handler = _get_mcp_handler(user, api_key)
-    elif token:
-        is_valid, payload, error = token_manager.verify_token(token)
-        if not is_valid:
-            raise HTTPException(status_code=401, detail=error)
-        user = user_store.get_user(payload.user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-        handler = _get_mcp_handler(user, api_key)
-    elif sid:
-        # Try to get session by ID
-        session = await get_session(sid)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        handler = session.handler
-        user = session.user
-    else:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    user_store.update_last_active(user.user_id)
-
-    # Process message
-    body = await request.body()
-    response = await handler.handle_message(body.decode("utf-8"))
-
-    return json.loads(response)
 
 
 # === Static Files (Frontend) ===
@@ -783,7 +559,7 @@ async def serve_frontend():
     if os.path.exists(index_path):
         with open(index_path, "r") as f:
             return HTMLResponse(content=f.read())
-    return HTMLResponse(content="<h1>SimpleMem MCP Server</h1><p>Frontend not found.</p>")
+    return HTMLResponse(content="<h1>SimpleMem MCP Server</h1><p>Single-tenant mode with S3 storage.</p>")
 
 
 # === Entry Point ===
@@ -796,3 +572,25 @@ def run_server(host: str = "0.0.0.0", port: int = 8000):
 
 if __name__ == "__main__":
     run_server()
+
+
+# =============================================================================
+# MULTI-TENANT HTTP SERVER CODE (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# Key differences in multi-tenant mode:
+# - User registration endpoint (/api/auth/register)
+# - JWT token generation and verification
+# - Per-user table isolation in LanceDB
+# - UserStore for SQLite user metadata
+# - OpenRouterClientManager for per-user API keys
+# - Session management with user_id validation
+#
+# Removed endpoints:
+# - POST /api/auth/register - User registration with OpenRouter API key
+# - GET /api/auth/verify - Token verification
+# - POST /api/auth/refresh - Token refresh
+# - GET /mcp/sse - Legacy SSE endpoint
+# - POST /mcp/message - Legacy message endpoint
+# =============================================================================

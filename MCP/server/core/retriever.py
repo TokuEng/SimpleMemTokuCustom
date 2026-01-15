@@ -7,7 +7,7 @@ Performs intelligent retrieval through:
 - Hybrid search (semantic + lexical + symbolic)
 - Reflection-based iterative refinement
 
-Refactored: Removed parallel processing for simplicity and stability.
+Single-tenant mode: No table_name parameter needed.
 """
 
 from typing import List, Optional, Dict, Any
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from ..auth.models import MemoryEntry
 from ..integrations.openrouter import OpenRouterClient
-from ..database.vector_store import MultiTenantVectorStore
+from ..database.vector_store import SingleTenantVectorStore
 
 
 @dataclass
@@ -32,14 +32,13 @@ class RetrievalPlan:
 class Retriever:
     """
     Adaptive retriever with intelligent query planning.
-    Sequential processing for stability.
+    Single-tenant mode - no table_name parameter needed.
     """
 
     def __init__(
         self,
         openrouter_client: OpenRouterClient,
-        vector_store: MultiTenantVectorStore,
-        table_name: str,
+        vector_store: SingleTenantVectorStore,
         semantic_top_k: int = 25,
         keyword_top_k: int = 5,
         enable_planning: bool = True,
@@ -49,7 +48,6 @@ class Retriever:
     ):
         self.client = openrouter_client
         self.vector_store = vector_store
-        self.table_name = table_name
         self.semantic_top_k = semantic_top_k
         self.keyword_top_k = keyword_top_k
         self.enable_planning = enable_planning
@@ -87,7 +85,6 @@ class Retriever:
         """Simple semantic search without planning"""
         query_embedding = await self.client.create_single_embedding(query)
         return await self.vector_store.semantic_search(
-            self.table_name,
             query_embedding,
             top_k=self.semantic_top_k,
         )
@@ -249,20 +246,18 @@ Return ONLY valid JSON."""
         all_results = []
 
         for query in queries:
-            # Semantic search
+            # Semantic search (no table_name parameter in single-tenant mode)
             query_embedding = await self.client.create_single_embedding(query)
             semantic_results = await self.vector_store.semantic_search(
-                self.table_name,
                 query_embedding,
                 top_k=self.semantic_top_k,
             )
             all_results.append(semantic_results)
 
-            # Keyword search
+            # Keyword search (no table_name parameter in single-tenant mode)
             keywords = self._extract_keywords(query)
             if keywords:
                 keyword_results = await self.vector_store.keyword_search(
-                    self.table_name,
                     keywords,
                     top_k=self.keyword_top_k,
                 )
@@ -487,20 +482,18 @@ Return ONLY valid JSON."""
         """
         all_results = []
 
-        # Semantic search
+        # Semantic search (no table_name parameter in single-tenant mode)
         query_embedding = await self.client.create_single_embedding(query)
         semantic_results = await self.vector_store.semantic_search(
-            self.table_name,
             query_embedding,
             top_k=self.semantic_top_k,
         )
         all_results.append(semantic_results)
 
-        # Keyword search
+        # Keyword search (no table_name parameter in single-tenant mode)
         keywords = self._extract_keywords(query)
         if keywords:
             keyword_results = await self.vector_store.keyword_search(
-                self.table_name,
                 keywords,
                 top_k=self.keyword_top_k,
             )
@@ -509,7 +502,6 @@ Return ONLY valid JSON."""
         # Structured search (if filters provided)
         if any([persons, location, entities, timestamp_start, timestamp_end]):
             structured_results = await self.vector_store.structured_search(
-                self.table_name,
                 persons=persons,
                 location=location,
                 entities=entities,
@@ -521,3 +513,17 @@ Return ONLY valid JSON."""
             all_results.insert(0, structured_results)
 
         return self._merge_and_deduplicate(all_results)
+
+
+# =============================================================================
+# MULTI-TENANT RETRIEVER (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# Key differences in multi-tenant mode:
+# - Constructor takes table_name parameter
+# - All vector_store calls include table_name:
+#   await self.vector_store.semantic_search(self.table_name, query_embedding, top_k)
+#   await self.vector_store.keyword_search(self.table_name, keywords, top_k)
+#   await self.vector_store.structured_search(self.table_name, ...)
+# =============================================================================

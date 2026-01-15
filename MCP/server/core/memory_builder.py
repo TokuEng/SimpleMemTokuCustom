@@ -6,7 +6,7 @@ Converts raw dialogues into atomic memory entries through:
 - Temporal anchoring (absolute timestamps)
 - Information extraction (keywords, persons, entities, etc.)
 
-Simplified: Direct processing without buffering.
+Single-tenant mode: Direct processing without table_name parameter.
 """
 
 from typing import List, Optional
@@ -15,27 +15,25 @@ import uuid
 
 from ..auth.models import MemoryEntry, Dialogue
 from ..integrations.openrouter import OpenRouterClient
-from ..database.vector_store import MultiTenantVectorStore
+from ..database.vector_store import SingleTenantVectorStore
 
 
 class MemoryBuilder:
     """
     Builds atomic memory entries from dialogues.
-    Direct processing - no buffering required.
+    Single-tenant mode - uses shared vector store directly.
     """
 
     def __init__(
         self,
         openrouter_client: OpenRouterClient,
-        vector_store: MultiTenantVectorStore,
-        table_name: str,
+        vector_store: SingleTenantVectorStore,
         window_size: int = 40,  # Max dialogues per LLM call
         overlap_size: int = 2,
         temperature: float = 0.1,
     ):
         self.client = openrouter_client
         self.vector_store = vector_store
-        self.table_name = table_name
         self.window_size = window_size
         self.overlap_size = overlap_size
         self.temperature = temperature
@@ -85,9 +83,8 @@ class MemoryBuilder:
         texts = [entry.lossless_restatement for entry in entries]
         embeddings = await self.client.create_embedding(texts)
 
-        # Store entries
+        # Store entries (no table_name parameter in single-tenant mode)
         count = await self.vector_store.add_entries(
-            self.table_name,
             entries,
             embeddings,
         )
@@ -147,9 +144,8 @@ class MemoryBuilder:
                 texts = [entry.lossless_restatement for entry in entries]
                 embeddings = await self.client.create_embedding(texts)
 
-                # Store entries
+                # Store entries (no table_name parameter in single-tenant mode)
                 count = await self.vector_store.add_entries(
-                    self.table_name,
                     entries,
                     embeddings,
                 )
@@ -277,9 +273,9 @@ class MemoryBuilder:
    - With: The actual person's name or entity
 
 4. **Temporal Anchoring**: Convert ALL relative times to absolute ISO 8601 format.
-   - "tomorrow" → Calculate actual date
-   - "next week" → Calculate actual date range
-   - "in 2 hours" → Calculate actual time
+   - "tomorrow" -> Calculate actual date
+   - "next week" -> Calculate actual date range
+   - "in 2 hours" -> Calculate actual time
 
 5. **Information Extraction**: For each entry, extract:
    - `lossless_restatement`: Complete, unambiguous fact
@@ -323,3 +319,15 @@ Return ONLY valid JSON. No explanations or other text."""
         return {
             "total_dialogues_processed": self._total_processed,
         }
+
+
+# =============================================================================
+# MULTI-TENANT MEMORY BUILDER (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# Key differences in multi-tenant mode:
+# - Constructor takes table_name parameter
+# - All vector_store calls include table_name:
+#   await self.vector_store.add_entries(self.table_name, entries, embeddings)
+# =============================================================================

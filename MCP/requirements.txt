@@ -1,4 +1,5 @@
 # SimpleMem MCP Server Dependencies
+# Single-Tenant Mode with S3 Storage
 
 # MCP SDK
 mcp>=1.0.0
@@ -15,9 +16,12 @@ lancedb>=0.4.0
 pyarrow>=14.0.0
 pandas>=2.0.0
 
-# Authentication
-PyJWT>=2.8.0
-cryptography>=41.0.0
+# S3/Spaces Support (for LanceDB storage)
+boto3>=1.34.0
+
+# Authentication (commented out - not needed for single-tenant mode)
+# PyJWT>=2.8.0
+# cryptography>=41.0.0
 
 # Utilities
 python-dotenv>=1.0.0

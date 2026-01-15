@@ -1,17 +1,17 @@
 """
-MCP Protocol Handler - JSON-RPC 2.0 over SSE
+MCP Protocol Handler - JSON-RPC 2.0 over Streamable HTTP
 
+Single-tenant implementation for SimpleMem MCP Server.
 Implements the Model Context Protocol for remote clients like Claude Desktop.
 """
 
 import json
-import asyncio
-from typing import Any, Optional, AsyncGenerator
-from dataclasses import dataclass, asdict
+from typing import Any, Optional
+from dataclasses import dataclass
 
-from .auth.models import User, MemoryEntry
-from .database.vector_store import MultiTenantVectorStore
-from .integrations.openrouter import OpenRouterClientManager
+from .auth.models import MemoryEntry
+from .database.vector_store import SingleTenantVectorStore
+from .integrations.openrouter import OpenRouterClient
 from .core.memory_builder import MemoryBuilder
 from .core.retriever import Retriever
 from .core.answer_generator import AnswerGenerator
@@ -49,21 +49,26 @@ SERVER_VERSION = "1.0.0"
 
 class MCPHandler:
     """
-    Handles MCP protocol messages for a specific user session.
+    Handles MCP protocol messages for single-tenant mode.
+    Uses a shared OpenRouter client and S3-backed vector store.
     """
 
     def __init__(
         self,
-        user: User,
-        api_key: str,
-        vector_store: MultiTenantVectorStore,
-        client_manager: OpenRouterClientManager,
+        openrouter_client: OpenRouterClient,
+        vector_store: SingleTenantVectorStore,
         settings: Any,
     ):
-        self.user = user
-        self.api_key = api_key
+        """
+        Initialize the MCP handler.
+
+        Args:
+            openrouter_client: Shared OpenRouter client
+            vector_store: S3-backed vector store
+            settings: Application settings
+        """
+        self.openrouter_client = openrouter_client
         self.vector_store = vector_store
-        self.client_manager = client_manager
         self.settings = settings
         self.initialized = False
 
@@ -72,15 +77,11 @@ class MCPHandler:
         self._retriever: Optional[Retriever] = None
         self._answer_generator: Optional[AnswerGenerator] = None
 
-    def _get_client(self):
-        return self.client_manager.get_client(self.api_key)
-
     def _get_memory_builder(self) -> MemoryBuilder:
         if not self._memory_builder:
             self._memory_builder = MemoryBuilder(
-                openrouter_client=self._get_client(),
+                openrouter_client=self.openrouter_client,
                 vector_store=self.vector_store,
-                table_name=self.user.table_name,
                 window_size=self.settings.window_size,
                 overlap_size=self.settings.overlap_size,
                 temperature=self.settings.llm_temperature,
@@ -90,9 +91,8 @@ class MCPHandler:
     def _get_retriever(self) -> Retriever:
         if not self._retriever:
             self._retriever = Retriever(
-                openrouter_client=self._get_client(),
+                openrouter_client=self.openrouter_client,
                 vector_store=self.vector_store,
-                table_name=self.user.table_name,
                 semantic_top_k=self.settings.semantic_top_k,
                 keyword_top_k=self.settings.keyword_top_k,
                 enable_planning=self.settings.enable_planning,
@@ -105,7 +105,7 @@ class MCPHandler:
     def _get_answer_generator(self) -> AnswerGenerator:
         if not self._answer_generator:
             self._answer_generator = AnswerGenerator(
-                openrouter_client=self._get_client(),
+                openrouter_client=self.openrouter_client,
                 temperature=self.settings.llm_temperature,
             )
         return self._answer_generator
@@ -177,7 +177,8 @@ class MCPHandler:
                 "description": "SimpleMem - Advanced Lifelong Memory System for LLM Agents. "
                               "Features: Semantic lossless compression, coreference resolution, "
                               "temporal anchoring, hybrid retrieval (semantic + lexical + symbolic), "
-                              "and intelligent query planning with reflection.",
+                              "and intelligent query planning with reflection. "
+                              "Single-tenant mode with S3 storage.",
             },
             "instructions": """SimpleMem is your long-term memory system. Use it to:
 
@@ -221,7 +222,7 @@ SimpleMem is an advanced lifelong memory system that:
 The dialogue is processed immediately by LLM and stored. No manual flush needed.
 
 Example: memory_add(speaker="Alice", content="I'll meet Bob at Starbucks tomorrow at 2pm")
-→ Stored as: "Alice will meet Bob at Starbucks on 2025-01-14 at 14:00"
+-> Stored as: "Alice will meet Bob at Starbucks on 2025-01-14 at 14:00"
    with metadata: persons=["Alice","Bob"], location="Starbucks", topic="Meeting arrangement\"""",
                     "inputSchema": {
                         "type": "object",
@@ -247,8 +248,8 @@ Example: memory_add(speaker="Alice", content="I'll meet Bob at Starbucks tomorro
                     "description": """Add multiple dialogues to SimpleMem at once.
 
 Efficient for importing conversation history. Each dialogue is processed with:
-- Coreference resolution (he/she → actual names)
-- Temporal anchoring (tomorrow → actual date)
+- Coreference resolution (he/she -> actual names)
+- Temporal anchoring (tomorrow -> actual date)
 - Entity extraction (persons, locations, organizations)
 
 All dialogues are processed immediately and stored. No manual flush needed.""",
@@ -328,7 +329,7 @@ Each entry contains: content (self-contained fact), timestamp, location, persons
                 },
                 {
                     "name": "memory_clear",
-                    "description": """Clear ALL memories for this user. This action CANNOT be undone.
+                    "description": """Clear ALL memories. This action CANNOT be undone.
 
 Use with caution. This removes all stored memory entries from the vector database.""",
                     "inputSchema": {
@@ -342,7 +343,7 @@ Use with caution. This removes all stored memory entries from the vector databas
 
 Returns:
 - Total number of stored memory entries
-- User ID and table info
+- Storage mode and location
 
 Use to check if memories are being stored correctly.""",
                     "inputSchema": {
@@ -443,20 +444,21 @@ Use to check if memories are being stored correctly.""",
         }
 
     async def _tool_memory_clear(self, args: dict) -> dict:
-        success = await self.vector_store.clear_table(self.user.table_name)
+        success = await self.vector_store.clear_table()
         return {
             "success": success,
             "message": "All memories cleared" if success else "Failed",
         }
 
     async def _tool_memory_stats(self, args: dict) -> dict:
-        stats = self.vector_store.get_stats(self.user.table_name)
+        stats = self.vector_store.get_stats()
         builder = self._get_memory_builder()
         builder_stats = builder.get_stats()
         return {
-            "user_id": self.user.user_id,
+            "mode": "single-tenant",
             "entry_count": stats.get("entry_count", 0),
             "total_dialogues_processed": builder_stats.get("total_dialogues_processed", 0),
+            "storage": stats.get("storage", "S3"),
         }
 
     async def _handle_resources_list(self, params: dict) -> dict:
@@ -464,13 +466,13 @@ Use to check if memories are being stored correctly.""",
         return {
             "resources": [
                 {
-                    "uri": f"memory://{self.user.user_id}/stats",
+                    "uri": "memory://stats",
                     "name": "Memory Statistics",
-                    "description": "Statistics about your memory store",
+                    "description": "Statistics about the memory store",
                     "mimeType": "application/json",
                 },
                 {
-                    "uri": f"memory://{self.user.user_id}/all",
+                    "uri": "memory://all",
                     "name": "All Memories",
                     "description": "All stored memory entries",
                     "mimeType": "application/json",
@@ -482,11 +484,11 @@ Use to check if memories are being stored correctly.""",
         """Handle resources/read request"""
         uri = params.get("uri", "")
 
-        if uri.endswith("/stats"):
-            stats = self.vector_store.get_stats(self.user.table_name)
+        if uri.endswith("/stats") or uri == "memory://stats":
+            stats = self.vector_store.get_stats()
             content = json.dumps(stats, ensure_ascii=False)
-        elif uri.endswith("/all"):
-            entries = await self.vector_store.get_all_entries(self.user.table_name)
+        elif uri.endswith("/all") or uri == "memory://all":
+            entries = await self.vector_store.get_all_entries()
             content = json.dumps({
                 "entries": [e.to_dict() for e in entries],
                 "total": len(entries),
@@ -503,3 +505,16 @@ Use to check if memories are being stored correctly.""",
                 }
             ]
         }
+
+
+# =============================================================================
+# MULTI-TENANT MCP HANDLER (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# Key differences in multi-tenant mode:
+# - Constructor takes User, api_key, client_manager instead of shared client
+# - Uses self.user.table_name for all vector store operations
+# - Resources list uses user_id in URIs
+# - Stats include user_id
+# =============================================================================
