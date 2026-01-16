@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 import lancedb
+import pandas as pd
 import pyarrow as pa
 
 from ..auth.models import MemoryEntry
@@ -342,12 +343,13 @@ class SingleTenantVectorStore:
             has_created_at = "created_at" in df.columns
 
             for _, row in df.iterrows():
-                # Safely get created_at value
+                # Safely get created_at value (use pd.notna to handle pandas NA/NaN)
                 created_at_val = None
                 if has_created_at:
                     try:
-                        created_at_val = row["created_at"] if row["created_at"] else None
-                    except (KeyError, TypeError):
+                        val = row["created_at"]
+                        created_at_val = val if pd.notna(val) else None
+                    except Exception:
                         created_at_val = None
 
                 entries.append(MemoryEntry(
