@@ -780,6 +780,8 @@ async def memory_viewer():
                 margin-bottom: 16px;
                 padding-bottom: 16px;
                 border-bottom: 1px solid rgba(255,255,255,0.08);
+                word-break: break-word;
+                overflow-wrap: break-word;
             }}
             .memory-meta {{
                 display: grid;
@@ -800,6 +802,8 @@ async def memory_viewer():
             .meta-value {{
                 font-size: 14px;
                 color: #a1a1aa;
+                word-break: break-word;
+                overflow-wrap: break-word;
             }}
             .meta-value.tag-list {{
                 color: #60a5fa;
