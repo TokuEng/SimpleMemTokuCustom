@@ -544,14 +544,30 @@ async def memory_viewer():
         entries = await vector_store.get_all_entries()
         # Use actual entries count, not cached stats
         entry_count = len(entries)
+
+        # Collect unique values for filters
+        all_topics = set()
+        all_persons = set()
+        all_entities = set()
+        for e in entries:
+            if e.topic:
+                all_topics.add(e.topic)
+            for p in (e.persons or []):
+                all_persons.add(p)
+            for ent in (e.entities or []):
+                all_entities.add(ent)
+
         entries_data = [
             {
+                "entry_id": e.entry_id,
                 "content": e.lossless_restatement,
                 "timestamp": e.timestamp or "—",
                 "created_at": e.created_at or "—",
                 "location": e.location or "—",
                 "persons": ", ".join(e.persons) if e.persons else "—",
+                "persons_list": e.persons or [],
                 "entities": ", ".join(e.entities) if e.entities else "—",
+                "entities_list": e.entities or [],
                 "topic": e.topic or "—",
                 "keywords": ", ".join(e.keywords) if e.keywords else "—",
             }
@@ -560,13 +576,23 @@ async def memory_viewer():
     except Exception as ex:
         entries_data = []
         entry_count = 0
+        all_topics = set()
+        all_persons = set()
+        all_entities = set()
         print(f"Error loading entries: {ex}")
 
     # Build memory cards HTML
     memory_cards = ""
     for i, entry in enumerate(entries_data):
+        # Convert lists to JSON for data attributes
+        persons_json = json.dumps(entry["persons_list"])
+        entities_json = json.dumps(entry["entities_list"])
         memory_cards += f'''
-        <div class="memory-card" data-index="{i}">
+        <div class="memory-card" data-index="{i}" data-entry-id="{entry["entry_id"]}" data-topic="{entry["topic"]}" data-persons='{persons_json}' data-entities='{entities_json}'>
+            <div class="card-header">
+                <input type="checkbox" class="memory-checkbox" data-entry-id="{entry["entry_id"]}" onchange="updateSelectionCount()">
+                <span class="card-index">#{i + 1}</span>
+            </div>
             <div class="memory-content">{entry["content"]}</div>
             <div class="memory-meta">
                 <div class="meta-row">
@@ -696,6 +722,12 @@ async def memory_viewer():
                 font-size: 14px;
                 margin-top: 4px;
             }}
+            .stat-sublabel {{
+                color: #52525b;
+                font-size: 11px;
+                margin-top: 2px;
+                font-style: italic;
+            }}
             .stat-card.status .stat-value {{
                 font-size: 18px;
                 background: none;
@@ -768,6 +800,93 @@ async def memory_viewer():
             }}
             .btn-danger:hover {{
                 background: rgba(239, 68, 68, 0.3);
+            }}
+            .btn-secondary {{
+                background: rgba(255, 255, 255, 0.1);
+                color: #a1a1aa;
+                border: 1px solid rgba(255,255,255,0.2);
+            }}
+            .btn-secondary:hover {{
+                background: rgba(255, 255, 255, 0.15);
+                color: #e4e4e7;
+            }}
+            .btn:disabled {{
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none !important;
+            }}
+
+            /* Filter Selects */
+            .filter-select {{
+                padding: 12px 16px;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 10px;
+                background: rgba(255,255,255,0.05);
+                color: #fff;
+                font-size: 14px;
+                cursor: pointer;
+                min-width: 140px;
+            }}
+            .filter-select:focus {{
+                outline: none;
+                border-color: #60a5fa;
+            }}
+            .filter-select option {{
+                background: #1a1a2e;
+                color: #fff;
+            }}
+
+            /* Selection Controls */
+            .selection-controls {{
+                display: flex;
+                gap: 12px;
+                margin-bottom: 16px;
+                align-items: center;
+                flex-wrap: wrap;
+                padding: 12px 16px;
+                background: rgba(255,255,255,0.03);
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.08);
+            }}
+            .select-all-label {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #a1a1aa;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            .select-all-label:hover {{
+                color: #e4e4e7;
+            }}
+            .selection-count {{
+                color: #60a5fa;
+                font-weight: 600;
+                font-size: 14px;
+                margin-left: auto;
+            }}
+
+            /* Card Header */
+            .card-header {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }}
+            .memory-checkbox {{
+                width: 18px;
+                height: 18px;
+                cursor: pointer;
+                accent-color: #60a5fa;
+            }}
+            .card-index {{
+                font-size: 12px;
+                color: #71717a;
+                font-weight: 600;
+            }}
+            .memory-card.selected {{
+                border-color: #60a5fa;
+                background: rgba(96, 165, 250, 0.1);
             }}
 
             /* Memory Grid */
@@ -944,8 +1063,14 @@ async def memory_viewer():
                     <div class="stat-label">Storage Status</div>
                 </div>
                 <div class="stat-card">
+                    <div class="stat-value small">{settings.llm_model}</div>
+                    <div class="stat-label">LLM Model</div>
+                    <div class="stat-sublabel">Memory extraction & answers</div>
+                </div>
+                <div class="stat-card">
                     <div class="stat-value small">{settings.embedding_model}</div>
                     <div class="stat-label">Embedding Model</div>
+                    <div class="stat-sublabel">Vector indexing & search</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value">{settings.embedding_dimension}</div>
@@ -957,6 +1082,32 @@ async def memory_viewer():
                 <div class="search-box">
                     <input type="text" id="searchInput" placeholder="Search memories..." onkeyup="filterMemories()">
                 </div>
+                <select id="topicFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Topics</option>
+                    {''.join(f'<option value="{t}">{t}</option>' for t in sorted(all_topics))}
+                </select>
+                <select id="personFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Persons</option>
+                    {''.join(f'<option value="{p}">{p}</option>' for p in sorted(all_persons))}
+                </select>
+                <select id="entityFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Entities</option>
+                    {''.join(f'<option value="{e}">{e}</option>' for e in sorted(all_entities))}
+                </select>
+                <button class="btn btn-secondary" onclick="clearFilters()">
+                    Clear Filters
+                </button>
+            </div>
+
+            <div class="selection-controls">
+                <label class="select-all-label">
+                    <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+                    Select All Visible
+                </label>
+                <span id="selectionCount" class="selection-count">0 selected</span>
+                <button class="btn btn-danger" id="deleteSelectedBtn" onclick="showDeleteSelectedModal()" disabled>
+                    🗑 Delete Selected
+                </button>
                 <button class="btn btn-primary" onclick="location.reload()">
                     ↻ Refresh
                 </button>
@@ -986,23 +1137,127 @@ async def memory_viewer():
             </div>
         </div>
 
+        <!-- Delete Selected Confirmation Modal -->
+        <div class="modal-overlay" id="deleteSelectedModal">
+            <div class="modal">
+                <h3>⚠️ Delete Selected Memories?</h3>
+                <p id="deleteSelectedCount">This action cannot be undone.</p>
+                <div class="modal-buttons">
+                    <button class="btn btn-primary" onclick="hideDeleteSelectedModal()">Cancel</button>
+                    <button class="btn btn-danger" onclick="deleteSelectedMemories()">Delete Selected</button>
+                </div>
+            </div>
+        </div>
+
         <script>
+            // Filter memories by text search and dropdown filters
             function filterMemories() {{
                 const query = document.getElementById('searchInput').value.toLowerCase();
+                const topicFilter = document.getElementById('topicFilter').value;
+                const personFilter = document.getElementById('personFilter').value;
+                const entityFilter = document.getElementById('entityFilter').value;
                 const cards = document.querySelectorAll('.memory-card');
 
                 cards.forEach(card => {{
                     const content = card.textContent.toLowerCase();
-                    card.style.display = content.includes(query) ? 'block' : 'none';
+                    const topic = card.dataset.topic || '';
+                    const persons = JSON.parse(card.dataset.persons || '[]');
+                    const entities = JSON.parse(card.dataset.entities || '[]');
+
+                    // Check text search
+                    const matchesText = !query || content.includes(query);
+
+                    // Check topic filter
+                    const matchesTopic = !topicFilter || topic === topicFilter;
+
+                    // Check person filter
+                    const matchesPerson = !personFilter || persons.includes(personFilter);
+
+                    // Check entity filter
+                    const matchesEntity = !entityFilter || entities.includes(entityFilter);
+
+                    // Show if all filters match
+                    card.style.display = (matchesText && matchesTopic && matchesPerson && matchesEntity) ? 'block' : 'none';
                 }});
+
+                // Update select all checkbox state
+                updateSelectAllState();
             }}
 
+            function clearFilters() {{
+                document.getElementById('searchInput').value = '';
+                document.getElementById('topicFilter').value = '';
+                document.getElementById('personFilter').value = '';
+                document.getElementById('entityFilter').value = '';
+                filterMemories();
+            }}
+
+            // Selection functions
+            function toggleSelectAll() {{
+                const selectAll = document.getElementById('selectAll').checked;
+                const visibleCards = document.querySelectorAll('.memory-card[style="display: block"], .memory-card:not([style*="display"])');
+
+                visibleCards.forEach(card => {{
+                    if (card.style.display !== 'none') {{
+                        const checkbox = card.querySelector('.memory-checkbox');
+                        if (checkbox) {{
+                            checkbox.checked = selectAll;
+                            card.classList.toggle('selected', selectAll);
+                        }}
+                    }}
+                }});
+
+                updateSelectionCount();
+            }}
+
+            function updateSelectAllState() {{
+                const visibleCheckboxes = [];
+                document.querySelectorAll('.memory-card').forEach(card => {{
+                    if (card.style.display !== 'none') {{
+                        const checkbox = card.querySelector('.memory-checkbox');
+                        if (checkbox) visibleCheckboxes.push(checkbox);
+                    }}
+                }});
+
+                const allChecked = visibleCheckboxes.length > 0 && visibleCheckboxes.every(cb => cb.checked);
+                document.getElementById('selectAll').checked = allChecked;
+            }}
+
+            function updateSelectionCount() {{
+                const selected = document.querySelectorAll('.memory-checkbox:checked');
+                const count = selected.length;
+                document.getElementById('selectionCount').textContent = count + ' selected';
+
+                const deleteBtn = document.getElementById('deleteSelectedBtn');
+                deleteBtn.disabled = count === 0;
+
+                // Update card styling
+                document.querySelectorAll('.memory-card').forEach(card => {{
+                    const checkbox = card.querySelector('.memory-checkbox');
+                    card.classList.toggle('selected', checkbox && checkbox.checked);
+                }});
+
+                updateSelectAllState();
+            }}
+
+            // Modal functions
             function showClearModal() {{
                 document.getElementById('clearModal').classList.add('active');
             }}
 
             function hideClearModal() {{
                 document.getElementById('clearModal').classList.remove('active');
+            }}
+
+            function showDeleteSelectedModal() {{
+                const count = document.querySelectorAll('.memory-checkbox:checked').length;
+                document.getElementById('deleteSelectedCount').textContent =
+                    'This action cannot be undone. ' + count + ' memor' + (count === 1 ? 'y' : 'ies') + ' will be permanently deleted.';
+                document.getElementById('deleteSelectedModal').classList.add('active');
+            }}
+
+            function hideDeleteSelectedModal() {{
+                document.getElementById('deleteSelectedModal').classList.remove('active');
             }}
 
             async function clearAllMemories() {{
@@ -1048,9 +1303,44 @@ async def memory_viewer():
                 }}
             }}
 
-            // Close modal on escape key
+            async function deleteSelectedMemories() {{
+                try {{
+                    const selectedCheckboxes = document.querySelectorAll('.memory-checkbox:checked');
+                    const entryIds = Array.from(selectedCheckboxes).map(cb => cb.dataset.entryId);
+
+                    if (entryIds.length === 0) {{
+                        hideDeleteSelectedModal();
+                        return;
+                    }}
+
+                    const response = await fetch('/api/memories/delete', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json'
+                        }},
+                        body: JSON.stringify({{ entry_ids: entryIds }})
+                    }});
+
+                    const result = await response.json();
+
+                    if (result.success) {{
+                        location.reload();
+                    }} else {{
+                        alert('Error deleting memories: ' + (result.error || 'Unknown error'));
+                        hideDeleteSelectedModal();
+                    }}
+                }} catch (err) {{
+                    alert('Error deleting memories: ' + err.message);
+                    hideDeleteSelectedModal();
+                }}
+            }}
+
+            // Close modals on escape key
             document.addEventListener('keydown', (e) => {{
-                if (e.key === 'Escape') hideClearModal();
+                if (e.key === 'Escape') {{
+                    hideClearModal();
+                    hideDeleteSelectedModal();
+                }}
             }});
         </script>
     </body>
@@ -1083,6 +1373,22 @@ async def get_memories_api():
         }
     except Exception as ex:
         return {"success": False, "error": str(ex), "memories": []}
+
+
+@app.post("/api/memories/delete")
+async def delete_memories_api(request: Request):
+    """Delete specific memories by their entry IDs"""
+    try:
+        body = await request.json()
+        entry_ids = body.get("entry_ids", [])
+
+        if not entry_ids:
+            return {"success": False, "error": "No entry_ids provided", "deleted": 0}
+
+        deleted_count = await vector_store.delete_entries(entry_ids)
+        return {"success": True, "deleted": deleted_count}
+    except Exception as ex:
+        return {"success": False, "error": str(ex), "deleted": 0}
 
 
 # === Root Endpoint (Single-Tenant Status Page) ===

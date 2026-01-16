@@ -374,6 +374,35 @@ class SingleTenantVectorStore:
             print(f"Clear table error: {e}")
             return False
 
+    async def delete_entries(self, entry_ids: List[str]) -> int:
+        """Delete specific entries by their IDs
+
+        Args:
+            entry_ids: List of entry IDs to delete
+
+        Returns:
+            Number of entries deleted
+        """
+        if not entry_ids:
+            return 0
+
+        table = self._get_table()
+        try:
+            # Build WHERE clause for deletion
+            # LanceDB uses SQL-like syntax for deletion
+            placeholders = ", ".join([f"'{eid}'" for eid in entry_ids])
+            where_clause = f"entry_id IN ({placeholders})"
+
+            before_count = table.count_rows()
+            table.delete(where_clause)
+            after_count = table.count_rows()
+
+            return before_count - after_count
+
+        except Exception as e:
+            print(f"Delete entries error: {e}")
+            return 0
+
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics for the table"""
         try:

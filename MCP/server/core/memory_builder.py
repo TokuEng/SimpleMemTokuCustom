@@ -188,7 +188,8 @@ class MemoryBuilder:
                     "You are a professional information extraction assistant. "
                     "Extract atomic, self-contained facts from dialogues. "
                     "Each fact must be independently understandable without context. "
-                    "Always resolve pronouns to actual names and convert relative times to absolute timestamps."
+                    "Always resolve pronouns to actual names and convert relative times to absolute timestamps. "
+                    "IMPORTANT: Every fact MUST start with a project tag: [TGA], [HRIS], [Infra], or [Team]."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -264,20 +265,28 @@ class MemoryBuilder:
 
 1. **Complete Coverage**: Capture ALL valuable information from the dialogues.
 
-2. **Self-Contained Facts**: Each entry must be independently understandable.
-   - BAD: "He will meet Bob tomorrow" (Who is "he"? When is "tomorrow"?)
-   - GOOD: "Alice will meet Bob at Starbucks on 2025-01-15 at 14:00"
+2. **Project Namespacing (IMPORTANT!)**: Every memory MUST start with a project tag:
+   - `[TGA]` — Token Grant Administration related
+   - `[HRIS]` — Lilith/HRIS platform related
+   - `[Infra]` — Infrastructure/DevOps related
+   - `[Team]` — Cross-project team decisions
+   - Example: "[TGA] The implementation plan for Contractor Payroll includes 111 issues."
+   - Choose the MOST relevant tag based on the content topic.
 
-3. **Coreference Resolution**: Replace ALL pronouns with actual names.
+3. **Self-Contained Facts**: Each entry must be independently understandable.
+   - BAD: "He will meet Bob tomorrow" (Who is "he"? When is "tomorrow"?)
+   - GOOD: "[Team] Alice will meet Bob at Starbucks on 2025-01-15 at 14:00"
+
+4. **Coreference Resolution**: Replace ALL pronouns with actual names.
    - Replace: he, she, it, they, him, her, them, his, hers, their
    - With: The actual person's name or entity
 
-4. **Temporal Anchoring**: Convert ALL relative times to absolute ISO 8601 format.
+5. **Temporal Anchoring**: Convert ALL relative times to absolute ISO 8601 format.
    - "tomorrow" -> Calculate actual date
    - "next week" -> Calculate actual date range
    - "in 2 hours" -> Calculate actual time
 
-5. **Information Extraction**: For each entry, extract:
+6. **Information Extraction**: For each entry, extract:
    - `lossless_restatement`: Complete, unambiguous fact
    - `keywords`: Core terms for search (3-7 keywords)
    - `timestamp`: ISO 8601 format if mentioned
@@ -290,7 +299,7 @@ class MemoryBuilder:
 {{
   "entries": [
     {{
-      "lossless_restatement": "Complete self-contained fact...",
+      "lossless_restatement": "[TGA] Complete self-contained fact starting with project tag...",
       "keywords": ["keyword1", "keyword2", ...],
       "timestamp": "2025-01-15T14:00:00" or null,
       "location": "Starbucks, Downtown" or null,
