@@ -654,7 +654,7 @@ async def memory_viewer():
         </div>
         '''
 
-    html = f'''
+    page_html = f'''
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -1363,7 +1363,7 @@ async def memory_viewer():
     </body>
     </html>
     '''
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=page_html)
 
 
 # === API Endpoint for Memory Data (JSON) ===
@@ -1422,7 +1422,7 @@ async def root_status():
     s3_ok, _ = vector_store.test_connection()
     status_color = "#22c55e" if s3_ok else "#ef4444"
 
-    html = f"""
+    page_html = f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -1456,7 +1456,7 @@ curl -X POST {settings.mcp_base_url or 'http://localhost:' + str(settings.port)}
     </body>
     </html>
     """
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=page_html)
 
 
 # === Entry Point ===
