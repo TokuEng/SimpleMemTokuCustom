@@ -3,6 +3,7 @@ Single-tenant vector store for SimpleMem MCP Server
 Uses LanceDB with S3-compatible storage (DigitalOcean Spaces)
 """
 
+import re
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -10,6 +11,12 @@ import lancedb
 import pyarrow as pa
 
 from ..auth.models import MemoryEntry
+
+# UUID validation pattern (standard UUID format)
+UUID_PATTERN = re.compile(
+    r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
+    re.IGNORECASE
+)
 
 
 # LanceDB schema for memory entries
@@ -382,14 +389,23 @@ class SingleTenantVectorStore:
 
         Returns:
             Number of entries deleted
+
+        Raises:
+            ValueError: If any entry_id is not a valid UUID format
         """
         if not entry_ids:
             return 0
+
+        # Validate all entry IDs are valid UUIDs to prevent injection
+        for eid in entry_ids:
+            if not UUID_PATTERN.match(eid):
+                raise ValueError(f"Invalid entry_id format (must be UUID): {eid}")
 
         table = self._get_table()
         try:
             # Build WHERE clause for deletion
             # LanceDB uses SQL-like syntax for deletion
+            # Entry IDs are validated as UUIDs above, safe to interpolate
             placeholders = ", ".join([f"'{eid}'" for eid in entry_ids])
             where_clause = f"entry_id IN ({placeholders})"
 

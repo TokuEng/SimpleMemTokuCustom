@@ -85,6 +85,7 @@ class MCPHandler:
                 window_size=self.settings.window_size,
                 overlap_size=self.settings.overlap_size,
                 temperature=self.settings.llm_temperature,
+                project_tags=self.settings.get_project_tags(),
             )
         return self._memory_builder
 

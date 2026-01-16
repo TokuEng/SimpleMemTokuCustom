@@ -48,6 +48,10 @@ class Settings:
     )
     s3_region: str = field(default_factory=lambda: os.getenv("S3_REGION", "nyc3"))
 
+    # Public base URL for MCP endpoint (used in documentation/examples)
+    # If not set, defaults to empty string (relative URLs)
+    mcp_base_url: str = field(default_factory=lambda: os.getenv("MCP_BASE_URL", ""))
+
     # LanceDB path (computed from S3 settings in __post_init__)
     lancedb_path: str = ""
 
@@ -69,6 +73,17 @@ class Settings:
     llm_temperature: float = 0.1
     llm_max_retries: int = 3
     use_streaming: bool = True
+
+    # Memory extraction project tags for namespacing memories
+    # Format: comma-separated list of "TAG:Description" pairs
+    # Default tags are applied if MEMORY_PROJECT_TAGS env var is not set
+    # Set to empty string to disable project tagging entirely
+    memory_project_tags: str = field(
+        default_factory=lambda: os.getenv(
+            "MEMORY_PROJECT_TAGS",
+            "TGA:Token Grant Administration,HRIS:Lilith/HRIS platform,Infra:Infrastructure/DevOps,Team:Cross-project team decisions"
+        )
+    )
 
     def __post_init__(self):
         """Validate required configuration and compute derived values"""
@@ -101,6 +116,29 @@ class Settings:
             "aws_endpoint": self.s3_endpoint,
             "aws_region": self.s3_region,
         }
+
+    def get_project_tags(self) -> dict:
+        """
+        Parse memory_project_tags into a dictionary.
+
+        Returns:
+            Dict mapping tag names to descriptions, e.g.:
+            {"TGA": "Token Grant Administration", "HRIS": "HR Information System"}
+            Empty dict if no tags configured.
+        """
+        if not self.memory_project_tags:
+            return {}
+
+        tags = {}
+        for item in self.memory_project_tags.split(","):
+            item = item.strip()
+            if ":" in item:
+                tag, description = item.split(":", 1)
+                tags[tag.strip()] = description.strip()
+            elif item:
+                # Tag without description
+                tags[item] = item
+        return tags
 
 
 # Clear the lru_cache when needed (for testing)

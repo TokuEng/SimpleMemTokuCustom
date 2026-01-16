@@ -41,8 +41,9 @@ class SimpleAuthManager:
         if not self.auth_enabled:
             return True, None  # Auth disabled, allow all
 
-        if not token:
-            return False, "Missing access token"
+        # Check for missing or empty/whitespace-only token
+        if not token or not token.strip():
+            return False, "Missing or empty access token"
 
         # Use constant-time comparison to prevent timing attacks
         if secrets.compare_digest(token, self.access_key):

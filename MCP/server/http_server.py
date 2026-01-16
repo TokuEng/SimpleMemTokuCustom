@@ -15,8 +15,11 @@ Streamable HTTP Transport:
 """
 
 import asyncio
+import html
 import json
+import logging
 import os
+import re
 import secrets
 from typing import Optional
 from datetime import datetime
@@ -35,6 +38,9 @@ from .mcp_handler import MCPHandler
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import get_settings
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 # === Session Management ===
@@ -395,10 +401,15 @@ async def mcp_post_endpoint(
 
     # Auto-create session if not found (resilient mode)
     # This handles cases where session expired or server restarted
+    session_recreated = False
     if not session:
         session = await get_or_create_session()
         session.initialized = True  # Mark as initialized since client already initialized
-        print(f"Auto-created new session {session.session_id} (previous: {mcp_session_id or 'none'})")
+        session_recreated = True
+        logger.warning(
+            f"Session not found or expired, created new session {session.session_id} "
+            f"(previous session_id: {mcp_session_id or 'none'})"
+        )
 
     # If only notifications or responses, return 202 Accepted
     if _is_notification_or_response_only(data):
@@ -410,9 +421,14 @@ async def mcp_post_endpoint(
     response_str = await session.handler.handle_message(json.dumps(data))
     response_data = json.loads(response_str)
 
+    # Build response headers
+    response_headers = {"Mcp-Session-Id": session.session_id}
+    if session_recreated:
+        response_headers["X-Session-Recreated"] = "true"
+
     return JSONResponse(
         content=response_data,
-        headers={"Mcp-Session-Id": session.session_id},
+        headers=response_headers,
     )
 
 
@@ -545,31 +561,32 @@ async def memory_viewer():
         # Use actual entries count, not cached stats
         entry_count = len(entries)
 
-        # Collect unique values for filters
+        # Collect unique values for filters (escaped for safe HTML output)
         all_topics = set()
         all_persons = set()
         all_entities = set()
         for e in entries:
             if e.topic:
-                all_topics.add(e.topic)
+                all_topics.add(html.escape(e.topic))
             for p in (e.persons or []):
-                all_persons.add(p)
+                all_persons.add(html.escape(p))
             for ent in (e.entities or []):
-                all_entities.add(ent)
+                all_entities.add(html.escape(ent))
 
         entries_data = [
             {
-                "entry_id": e.entry_id,
-                "content": e.lossless_restatement,
-                "timestamp": e.timestamp or "—",
-                "created_at": e.created_at or "—",
-                "location": e.location or "—",
-                "persons": ", ".join(e.persons) if e.persons else "—",
-                "persons_list": e.persons or [],
-                "entities": ", ".join(e.entities) if e.entities else "—",
-                "entities_list": e.entities or [],
-                "topic": e.topic or "—",
-                "keywords": ", ".join(e.keywords) if e.keywords else "—",
+                # Escape all user-provided content to prevent XSS attacks
+                "entry_id": html.escape(e.entry_id) if e.entry_id else "",
+                "content": html.escape(e.lossless_restatement) if e.lossless_restatement else "",
+                "timestamp": html.escape(e.timestamp) if e.timestamp else "—",
+                "created_at": html.escape(e.created_at) if e.created_at else "—",
+                "location": html.escape(e.location) if e.location else "—",
+                "persons": html.escape(", ".join(e.persons)) if e.persons else "—",
+                "persons_list": [html.escape(p) for p in (e.persons or [])],
+                "entities": html.escape(", ".join(e.entities)) if e.entities else "—",
+                "entities_list": [html.escape(ent) for ent in (e.entities or [])],
+                "topic": html.escape(e.topic) if e.topic else "—",
+                "keywords": html.escape(", ".join(e.keywords)) if e.keywords else "—",
             }
             for e in entries
         ]
@@ -1376,8 +1393,14 @@ async def get_memories_api():
 
 
 @app.post("/api/memories/delete")
-async def delete_memories_api(request: Request):
+async def delete_memories_api(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
     """Delete specific memories by their entry IDs"""
+    # Authenticate (consistent with /mcp endpoints)
+    await verify_bearer_token(authorization)
+
     try:
         body = await request.json()
         entry_ids = body.get("entry_ids", [])
@@ -1426,7 +1449,7 @@ async def root_status():
 
         <h3>Quick Test</h3>
         <pre style="background: #1f2937; color: #f3f4f6; padding: 15px; border-radius: 8px; overflow-x: auto;">
-curl -X POST {settings.s3_endpoint.replace('digitaloceanspaces.com', 'ondigitalocean.app')}/mcp \\
+curl -X POST {settings.mcp_base_url or 'http://localhost:' + str(settings.port)}/mcp \\
   -H "Content-Type: application/json" \\
   -H "Accept: application/json" \\
   -d '{{"jsonrpc":"2.0","method":"initialize","id":1,"params":{{}}}}'</pre>

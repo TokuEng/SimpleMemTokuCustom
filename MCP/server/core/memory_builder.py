@@ -31,12 +31,16 @@ class MemoryBuilder:
         window_size: int = 40,  # Max dialogues per LLM call
         overlap_size: int = 2,
         temperature: float = 0.1,
+        project_tags: Optional[dict] = None,
     ):
         self.client = openrouter_client
         self.vector_store = vector_store
         self.window_size = window_size
         self.overlap_size = overlap_size
         self.temperature = temperature
+        # Optional project tags for namespacing memories
+        # Format: {"TAG": "Description", ...}
+        self.project_tags = project_tags or {}
 
         # Context from previous processing for deduplication
         self._previous_context: str = ""
@@ -180,18 +184,20 @@ class MemoryBuilder:
         # Build prompt
         prompt = self._build_extraction_prompt(dialogue_text)
 
+        # Build system prompt (conditionally include project tags instruction)
+        system_content = (
+            "You are a professional information extraction assistant. "
+            "Extract atomic, self-contained facts from dialogues. "
+            "Each fact must be independently understandable without context. "
+            "Always resolve pronouns to actual names and convert relative times to absolute timestamps."
+        )
+        if self.project_tags:
+            tag_list = ", ".join(f"[{tag}]" for tag in self.project_tags.keys())
+            system_content += f" IMPORTANT: Every fact MUST start with a project tag: {tag_list}."
+
         # Call LLM
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional information extraction assistant. "
-                    "Extract atomic, self-contained facts from dialogues. "
-                    "Each fact must be independently understandable without context. "
-                    "Always resolve pronouns to actual names and convert relative times to absolute timestamps. "
-                    "IMPORTANT: Every fact MUST start with a project tag: [TGA], [HRIS], [Infra], or [Team]."
-                ),
-            },
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ]
 
@@ -256,6 +262,34 @@ class MemoryBuilder:
 ---
 """
 
+        # Build project tags section if configured
+        project_section = ""
+        example_prefix = ""
+        if self.project_tags:
+            tag_lines = "\n".join(
+                f"   - `[{tag}]` — {desc}"
+                for tag, desc in self.project_tags.items()
+            )
+            project_section = f"""
+2. **Project Namespacing (IMPORTANT!)**: Every memory MUST start with a project tag:
+{tag_lines}
+   - Choose the MOST relevant tag based on the content topic.
+"""
+            first_tag = list(self.project_tags.keys())[0]
+            example_prefix = f"[{first_tag}] "
+
+        # Adjust numbering based on whether project tags are included
+        if self.project_tags:
+            fact_num = "3"
+            coref_num = "4"
+            temporal_num = "5"
+            extract_num = "6"
+        else:
+            fact_num = "2"
+            coref_num = "3"
+            temporal_num = "4"
+            extract_num = "5"
+
         return f"""{context_section}## Dialogues to Process:
 {dialogue_text}
 
@@ -264,30 +298,22 @@ class MemoryBuilder:
 ## Extraction Requirements:
 
 1. **Complete Coverage**: Capture ALL valuable information from the dialogues.
-
-2. **Project Namespacing (IMPORTANT!)**: Every memory MUST start with a project tag:
-   - `[TGA]` — Token Grant Administration related
-   - `[HRIS]` — Lilith/HRIS platform related
-   - `[Infra]` — Infrastructure/DevOps related
-   - `[Team]` — Cross-project team decisions
-   - Example: "[TGA] The implementation plan for Contractor Payroll includes 111 issues."
-   - Choose the MOST relevant tag based on the content topic.
-
-3. **Self-Contained Facts**: Each entry must be independently understandable.
+{project_section}
+{fact_num}. **Self-Contained Facts**: Each entry must be independently understandable.
    - BAD: "He will meet Bob tomorrow" (Who is "he"? When is "tomorrow"?)
-   - GOOD: "[Team] Alice will meet Bob at Starbucks on 2025-01-15 at 14:00"
+   - GOOD: "{example_prefix}Alice will meet Bob at Starbucks on 2025-01-15 at 14:00"
 
-4. **Coreference Resolution**: Replace ALL pronouns with actual names.
+{coref_num}. **Coreference Resolution**: Replace ALL pronouns with actual names.
    - Replace: he, she, it, they, him, her, them, his, hers, their
    - With: The actual person's name or entity
 
-5. **Temporal Anchoring**: Convert ALL relative times to absolute ISO 8601 format.
+{temporal_num}. **Temporal Anchoring**: Convert ALL relative times to absolute ISO 8601 format.
    - "tomorrow" -> Calculate actual date
    - "next week" -> Calculate actual date range
    - "in 2 hours" -> Calculate actual time
 
-6. **Information Extraction**: For each entry, extract:
-   - `lossless_restatement`: Complete, unambiguous fact
+{extract_num}. **Information Extraction**: For each entry, extract:
+   - `lossless_restatement`: Complete, unambiguous fact{" (starting with project tag)" if self.project_tags else ""}
    - `keywords`: Core terms for search (3-7 keywords)
    - `timestamp`: ISO 8601 format if mentioned
    - `location`: Specific location name
@@ -299,7 +325,7 @@ class MemoryBuilder:
 {{
   "entries": [
     {{
-      "lossless_restatement": "[TGA] Complete self-contained fact starting with project tag...",
+      "lossless_restatement": "{example_prefix}Complete self-contained fact...",
       "keywords": ["keyword1", "keyword2", ...],
       "timestamp": "2025-01-15T14:00:00" or null,
       "location": "Starbucks, Downtown" or null,
