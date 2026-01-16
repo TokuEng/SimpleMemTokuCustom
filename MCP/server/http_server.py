@@ -547,11 +547,13 @@ async def memory_viewer():
         entries_data = [
             {
                 "content": e.lossless_restatement,
-                "timestamp": e.timestamp,
+                "timestamp": e.timestamp or "—",
+                "created_at": e.created_at or "—",
                 "location": e.location or "—",
                 "persons": ", ".join(e.persons) if e.persons else "—",
                 "entities": ", ".join(e.entities) if e.entities else "—",
                 "topic": e.topic or "—",
+                "keywords": ", ".join(e.keywords) if e.keywords else "—",
             }
             for e in entries
         ]
@@ -568,8 +570,12 @@ async def memory_viewer():
             <div class="memory-content">{entry["content"]}</div>
             <div class="memory-meta">
                 <div class="meta-row">
-                    <span class="meta-label">Timestamp:</span>
+                    <span class="meta-label">Event Time:</span>
                     <span class="meta-value">{entry["timestamp"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Stored:</span>
+                    <span class="meta-value">{entry["created_at"]}</span>
                 </div>
                 <div class="meta-row">
                     <span class="meta-label">Persons:</span>
@@ -586,6 +592,10 @@ async def memory_viewer():
                 <div class="meta-row">
                     <span class="meta-label">Topic:</span>
                     <span class="meta-value topic">{entry["topic"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Keywords:</span>
+                    <span class="meta-value tag-list">{entry["keywords"]}</span>
                 </div>
             </div>
         </div>
@@ -690,6 +700,10 @@ async def memory_viewer():
                 font-size: 18px;
                 background: none;
                 -webkit-text-fill-color: {"#22c55e" if s3_ok else "#ef4444"};
+            }}
+            .stat-value.small {{
+                font-size: 14px;
+                word-break: break-all;
             }}
 
             /* Controls */
@@ -928,6 +942,14 @@ async def memory_viewer():
                 <div class="stat-card status">
                     <div class="stat-value">{"● Connected" if s3_ok else "● Disconnected"}</div>
                     <div class="stat-label">Storage Status</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value small">{settings.embedding_model}</div>
+                    <div class="stat-label">Embedding Model</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{settings.embedding_dimension}</div>
+                    <div class="stat-label">Vector Dimension</div>
                 </div>
             </div>
 

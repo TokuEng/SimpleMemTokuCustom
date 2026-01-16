@@ -22,6 +22,7 @@ class MemoryEntry:
     persons: list = field(default_factory=list)
     entities: list = field(default_factory=list)
     topic: Optional[str] = None
+    created_at: Optional[str] = None  # When stored in database
 
     def to_dict(self) -> dict:
         return {
@@ -33,6 +34,7 @@ class MemoryEntry:
             "persons": self.persons,
             "entities": self.entities,
             "topic": self.topic,
+            "created_at": self.created_at,
         }
 
     @classmethod
@@ -46,6 +48,7 @@ class MemoryEntry:
             persons=data.get("persons", []),
             entities=data.get("entities", []),
             topic=data.get("topic"),
+            created_at=data.get("created_at"),
         )
 
 

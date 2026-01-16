@@ -341,6 +341,7 @@ class SingleTenantVectorStore:
                     persons=list(row["persons"]) if row["persons"] is not None else [],
                     entities=list(row["entities"]) if row["entities"] is not None else [],
                     topic=row["topic"] if row["topic"] else None,
+                    created_at=row["created_at"] if "created_at" in row and row["created_at"] else None,
                 ))
 
             return entries
