@@ -338,7 +338,18 @@ class SingleTenantVectorStore:
             df = table.to_pandas()
             entries = []
 
+            # Check if created_at column exists (may not exist in older tables)
+            has_created_at = "created_at" in df.columns
+
             for _, row in df.iterrows():
+                # Safely get created_at value
+                created_at_val = None
+                if has_created_at:
+                    try:
+                        created_at_val = row["created_at"] if row["created_at"] else None
+                    except (KeyError, TypeError):
+                        created_at_val = None
+
                 entries.append(MemoryEntry(
                     entry_id=row["entry_id"],
                     lossless_restatement=row["lossless_restatement"],
@@ -348,7 +359,7 @@ class SingleTenantVectorStore:
                     persons=list(row["persons"]) if row["persons"] is not None else [],
                     entities=list(row["entities"]) if row["entities"] is not None else [],
                     topic=row["topic"] if row["topic"] else None,
-                    created_at=row["created_at"] if "created_at" in row and row["created_at"] else None,
+                    created_at=created_at_val,
                 ))
 
             return entries
