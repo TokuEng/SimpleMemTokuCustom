@@ -1393,14 +1393,12 @@ async def get_memories_api():
 
 
 @app.post("/api/memories/delete")
-async def delete_memories_api(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-):
-    """Delete specific memories by their entry IDs"""
-    # Authenticate (consistent with /mcp endpoints)
-    await verify_bearer_token(authorization)
+async def delete_memories_api(request: Request):
+    """Delete specific memories by their entry IDs
 
+    Note: No auth required - consistent with /memories viewer page.
+    The Memory Viewer is an internal admin tool.
+    """
     try:
         body = await request.json()
         entry_ids = body.get("entry_ids", [])
