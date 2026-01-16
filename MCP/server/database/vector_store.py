@@ -343,24 +343,32 @@ class SingleTenantVectorStore:
             has_created_at = "created_at" in df.columns
 
             for _, row in df.iterrows():
-                # Safely get created_at value (use pd.notna to handle pandas NA/NaN)
+                # Helper to safely get values (handles pandas NA/NaN)
+                def safe_get(val):
+                    return val if pd.notna(val) else None
+
+                def safe_get_list(val):
+                    if val is None or (hasattr(val, '__iter__') and pd.isna(val).any() if hasattr(pd.isna(val), 'any') else pd.isna(val)):
+                        return []
+                    return list(val) if val is not None else []
+
+                # Safely get created_at value
                 created_at_val = None
                 if has_created_at:
                     try:
-                        val = row["created_at"]
-                        created_at_val = val if pd.notna(val) else None
+                        created_at_val = safe_get(row["created_at"])
                     except Exception:
                         created_at_val = None
 
                 entries.append(MemoryEntry(
-                    entry_id=row["entry_id"],
-                    lossless_restatement=row["lossless_restatement"],
-                    keywords=list(row["keywords"]) if row["keywords"] is not None else [],
-                    timestamp=row["timestamp"] if row["timestamp"] else None,
-                    location=row["location"] if row["location"] else None,
-                    persons=list(row["persons"]) if row["persons"] is not None else [],
-                    entities=list(row["entities"]) if row["entities"] is not None else [],
-                    topic=row["topic"] if row["topic"] else None,
+                    entry_id=safe_get(row["entry_id"]) or "",
+                    lossless_restatement=safe_get(row["lossless_restatement"]) or "",
+                    keywords=safe_get_list(row["keywords"]),
+                    timestamp=safe_get(row["timestamp"]),
+                    location=safe_get(row["location"]),
+                    persons=safe_get_list(row["persons"]),
+                    entities=safe_get_list(row["entities"]),
+                    topic=safe_get(row["topic"]),
                     created_at=created_at_val,
                 ))
 
