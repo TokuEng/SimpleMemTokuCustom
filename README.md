@@ -261,6 +261,21 @@ The workflow consists of three simple steps:
 
 This design allows LLM agents to maintain context, recall past information efficiently, and avoid repeatedly processing redundant history.
 
+## ❓ Common Setup Issues & Troubleshooting
+
+If you encounter issues while setting up or running SimpleMem for the first time, check the following common cases:
+
+### 1️⃣ API Key Not Detected
+- Ensure your API key is correctly set in `config.py`
+- For OpenAI-compatible providers (Qwen, Azure, etc.), verify that `OPENAI_BASE_URL` is configured correctly
+- Restart your Python environment after updating the key
+
+### 2️⃣ Python Version Mismatch
+- SimpleMem requires **Python 3.10**
+- Check your version using:
+  ```bash
+  python --version
+
 ### 🎓 Basic Usage
 
 ```python
