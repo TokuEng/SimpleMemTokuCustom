@@ -1,8 +1,8 @@
 """
-Answer Generator - Final synthesis from retrieved atomic contexts
+Answer Generator - Final synthesis from retrieved contexts
 
-Paper Reference: Section 3.3 - Reconstructive Synthesis (Read Path)
-Generates answers from the final context C_final synthesized by query-aware retrieval
+Section 3.3: Intent-Aware Retrieval Planning
+Generates answers from the merged context C_q after multi-view retrieval
 """
 from typing import List
 from models.memory_entry import MemoryEntry
@@ -12,16 +12,9 @@ import config
 
 class AnswerGenerator:
     """
-    Answer Generator - Reconstructive Synthesis from Atomic Contexts
+    Answer Generator - Synthesis from retrieved memory units (Section 3.3)
 
-    Paper Reference: Section 3.3 - Eq. (10)
-    Synthesizes final answer from pruned, query-specific context:
-    C_final = ⊕_{m ∈ Top-k_dyn(S)} [t_m: Content(m)]
-
-    Features:
-    1. Receive query and retrieved atomic entries
-    2. Generate answers from disambiguated, self-contained facts
-    3. Ensure accuracy through atomic context independence
+    Generates answers from C_q = R_sem ∪ R_lex ∪ R_sym
     """
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client

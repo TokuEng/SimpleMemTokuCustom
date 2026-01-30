@@ -1,11 +1,10 @@
 """
-Vector Store - Structured Multi-View Indexing Implementation (Section 3.2)
+Vector Store - Multi-View Indexing (Section 3.1)
 
-Paper Reference: Section 3.2 - Structured Indexing
-Implements the three structured indexing dimensions:
-- Semantic Layer: Dense vectors v_k ∈ ℝ^d (embedding-based similarity)
-- Lexical Layer: Full-text search with Tantivy FTS
-- Symbolic Layer: Metadata R_k = {(key, val)} (structured filtering via SQL)
+Implements three-layer indexing I(m_k):
+- Semantic Layer: s_k = E_dense(m_k) - Dense vector similarity
+- Lexical Layer: l_k = E_sparse(m_k) - BM25 keyword matching (Tantivy FTS)
+- Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
 """
 from typing import List, Optional, Dict, Any
 import lancedb
@@ -18,13 +17,12 @@ import os
 
 class VectorStore:
     """
-    Structured Multi-View Indexing - Storage and retrieval for Atomic Entries
+    Multi-View Indexing - Storage and retrieval for memory units (Section 3.1)
 
-    Paper Reference: Section 3.2 - Structured Indexing
-    Implements M(m_k) with three structured layers:
-    1. Semantic Layer: Dense embedding vectors for conceptual similarity
-    2. Lexical Layer: Full-text search via Tantivy FTS index
-    3. Symbolic Layer: SQL-based metadata filtering with DataFusion
+    Three-layer indexing I(m_k):
+    1. Semantic Layer: Dense embeddings for conceptual similarity
+    2. Lexical Layer: Tantivy FTS for exact keyword matching
+    3. Symbolic Layer: SQL-based metadata filtering
     """
 
     def __init__(
@@ -151,10 +149,8 @@ class VectorStore:
 
     def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
         """
-        Semantic Layer Search - Dense vector similarity.
-
-        Paper Reference: Section 3.1
-        Retrieves based on v_k = E_dense(S_k) where S_k is the lossless restatement.
+        Semantic Layer Search - Dense vector similarity (Section 3.1)
+        s_k = E_dense(m_k)
         """
         try:
             if self.table.count_rows() == 0:
@@ -170,10 +166,8 @@ class VectorStore:
 
     def keyword_search(self, keywords: List[str], top_k: int = 3) -> List[MemoryEntry]:
         """
-        Lexical Layer Search - Full-text search via Tantivy FTS.
-
-        Paper Reference: Section 3.1
-        Retrieves based on BM25 text matching using LanceDB native FTS.
+        Lexical Layer Search - BM25 keyword matching (Section 3.1)
+        l_k = E_sparse(m_k)
         """
         try:
             if not keywords or self.table.count_rows() == 0:
@@ -197,11 +191,8 @@ class VectorStore:
         top_k: Optional[int] = None
     ) -> List[MemoryEntry]:
         """
-        Symbolic Layer Search - SQL-based metadata filtering.
-
-        Paper Reference: Section 3.1
-        Retrieves based on R_k = {(key, val)} for structured constraints.
-        Uses DataFusion SQL expressions with array_has_any for list columns.
+        Symbolic Layer Search - Metadata filtering (Section 3.1)
+        r_k = E_sym(m_k), filters by timestamps, entities, persons
         """
         try:
             if self.table.count_rows() == 0:

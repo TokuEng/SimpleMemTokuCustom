@@ -1,10 +1,10 @@
 """
 Memory Builder - Stage 1: Semantic Structured Compression (Section 3.1)
 
-Implements Semantic Structured Compression:
-- Entropy-based non-linear filter: Φ_gate (conceptual - filters low-density dialogue)
-- De-linearization transformation: F_θ (converts dialogue to atomic entries)
-- Generates self-contained Atomic Entries {m_k} via coreference resolution and temporal anchoring
+Implements:
+- Implicit semantic density gating: Φ_gate(W) → {m_k} (filters low-density windows)
+- Sliding window processing for dialogue segmentation
+- Generates compact memory units with resolved coreferences and absolute timestamps
 """
 from typing import List, Optional
 from models.memory_entry import MemoryEntry, Dialogue
@@ -19,16 +19,12 @@ from functools import partial
 
 class MemoryBuilder:
     """
-    Memory Builder - Stage 1: Semantic Structured Compression
-
-    Paper Reference: Section 3.1 - Semantic Structured Compression
+    Memory Builder - Semantic Structured Compression (Section 3.1)
 
     Core Functions:
-    1. Entropy-based filtering (implicit via window processing)
-    2. De-linearization transformation F_θ: Dialogue → Atomic Entries
-    3. Coreference resolution Φ_coref (no pronouns)
-    4. Temporal anchoring Φ_time (absolute timestamps)
-    5. Generate self-contained Atomic Entries {m_k}
+    1. Sliding window segmentation
+    2. Implicit semantic density gating: Φ_gate(W) → {m_k}
+    3. Multi-view indexing: I(m_k) = {s_k, l_k, r_k}
     """
     def __init__(
         self,
@@ -153,16 +149,8 @@ class MemoryBuilder:
 
     def _generate_memory_entries(self, dialogues: List[Dialogue]) -> List[MemoryEntry]:
         """
-        De-linearization Transformation F_θ: W_t → {m_k}
-
-        Paper Reference: Section 3.1 - Eq. (3)
-        Applies composite transformation: F_θ = Φ_time ∘ Φ_coref ∘ Φ_extract
-
-        Key requirements:
-        1. Generate multiple Atomic Entries to cover all information
-        2. Φ_coref: Force coreference resolution (no pronouns)
-        3. Φ_time: Temporal anchoring (convert relative to absolute time)
-        4. Reference previous window entries to avoid duplication
+        Implicit Semantic Density Gating (Section 3.1)
+        Φ_gate(W) → {m_k}, generates compact memory units from dialogue window
         """
         # Build dialogue text
         dialogue_text = "\n".join([str(d) for d in dialogues])

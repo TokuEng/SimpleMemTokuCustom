@@ -17,10 +17,10 @@ class SimpleMemSystem:
     """
     SimpleMem Main System
 
-    Three-stage pipeline based on Semantic Lossless Compression:
-    1. Semantic Structured Compression: add_dialogue() -> MemoryBuilder -> VectorStore
-    2. Structured Indexing and Recursive Consolidation: (background evolution - future work)
-    3. Adaptive Query-Aware Retrieval: ask() -> HybridRetriever -> AnswerGenerator
+    Three-stage pipeline:
+    1. Semantic Structured Compression (Section 3.1): add_dialogue() -> MemoryBuilder -> VectorStore
+    2. Online Semantic Synthesis (Section 3.2): Intra-session consolidation during write
+    3. Intent-Aware Retrieval Planning (Section 3.3): ask() -> HybridRetriever -> AnswerGenerator
     """
     def __init__(
         self,
@@ -156,10 +156,10 @@ class SimpleMemSystem:
         print(f"Question: {question}")
         print("=" * 60)
 
-        # Stage 2: Hybrid retrieval
+        # Stage 3: Intent-Aware Retrieval Planning
         contexts = self.hybrid_retriever.retrieve(question)
 
-        # Stage 3: Answer generation
+        # Generate answer from retrieved context C_q
         answer = self.answer_generator.generate_answer(question, contexts)
 
         print("\nAnswer:")

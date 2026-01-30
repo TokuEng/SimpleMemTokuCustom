@@ -1,12 +1,10 @@
 """
-Hybrid Retriever - Stage 3: Adaptive Query-Aware Retrieval with Pruning (Section 3.3)
+Hybrid Retriever - Stage 3: Intent-Aware Retrieval Planning (Section 3.3)
 
-Paper Reference: Section 3.3 - Adaptive Query-Aware Retrieval with Pruning
 Implements:
-- Hybrid scoring function S(q, m_k) aggregating semantic, lexical, and symbolic signals
-- Query Complexity estimation C_q for adaptive retrieval depth
-- Dynamic retrieval depth k_dyn = k_base · (1 + δ · C_q)
-- Complexity-Aware Pruning to minimize token usage while maximizing accuracy
+- Retrieval planning P(q, H) → {q_sem, q_lex, q_sym, d}
+- Parallel multi-view retrieval across Semantic, Lexical, Symbolic layers
+- Result merging: C_q = R_sem ∪ R_lex ∪ R_sym
 """
 from typing import List, Optional, Dict, Any
 from models.memory_entry import MemoryEntry
@@ -21,18 +19,15 @@ import concurrent.futures
 
 class HybridRetriever:
     """
-    Hybrid Retriever - Stage 3: Adaptive Query-Aware Retrieval with Pruning
-
-    Paper Reference: Section 3.3 - Adaptive Query-Aware Retrieval with Pruning
+    Hybrid Retriever - Intent-Aware Retrieval Planning (Section 3.3)
 
     Core Components:
-    1. Query-aware retrieval across three structured layers:
-       - Semantic Layer: Dense vector similarity
-       - Lexical Layer: Sparse keyword matching (BM25)
-       - Symbolic Layer: Metadata filtering
-    2. Hybrid Scoring Function S(q, m_k): aggregates multi-layer signals
-    3. Complexity-Aware Pruning: dynamic depth based on C_q
-    4. Planning-based multi-query decomposition for comprehensive retrieval
+    1. Retrieval planning: infers search intent and generates optimized queries
+    2. Parallel multi-view retrieval:
+       - Semantic: R_sem = Top-n(cos(E(q_sem), E(m_i)))
+       - Lexical: R_lex = Top-n(BM25(q_lex, m_i))
+       - Symbolic: R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
+    3. Result merging: C_q = R_sem ∪ R_lex ∪ R_sym
     """
     def __init__(
         self,
@@ -104,10 +99,23 @@ class HybridRetriever:
                 print(f"[Search {i}] {search_query}")
                 results = self._semantic_search(search_query)
                 all_results.extend(results)
-        
+
+        # Step 3.5: Execute keyword and structured searches (hybrid retrieval)
+        query_analysis = self._analyze_query(query)
+
+        # Keyword search (Lexical Layer)
+        keyword_results = self._keyword_search(query, query_analysis)
+        print(f"[Keyword Search] Found {len(keyword_results)} results")
+        all_results.extend(keyword_results)
+
+        # Structured search (Symbolic Layer)
+        structured_results = self._structured_search(query_analysis)
+        print(f"[Structured Search] Found {len(structured_results)} results")
+        all_results.extend(structured_results)
+
         # Step 4: Merge and deduplicate results
         merged_results = self._merge_and_deduplicate_entries(all_results)
-        print(f"[Planning] Found {len(merged_results)} unique results")
+        print(f"[Planning] Found {len(merged_results)} unique results (semantic + keyword + structured)")
         
         # Step 5: Optional reflection-based additional retrieval
         # Use override parameter if provided, otherwise use global setting
@@ -232,10 +240,8 @@ Return ONLY JSON, no other content.
 
     def _semantic_search(self, query: str) -> List[MemoryEntry]:
         """
-        Semantic Layer Retrieval
-
-        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
-        Retrieves based on dense vector similarity: λ₁ · cos(e_q, v_k)
+        Semantic Layer Retrieval (Section 3.3)
+        R_sem = Top-n(cos(E(q_sem), E(m_i)))
         """
         return self.vector_store.semantic_search(query, top_k=self.semantic_top_k)
 
@@ -245,10 +251,8 @@ Return ONLY JSON, no other content.
         query_analysis: Dict[str, Any]
     ) -> List[MemoryEntry]:
         """
-        Lexical Layer Retrieval
-
-        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
-        Retrieves based on sparse keyword matching: λ₂ · BM25(q_lex, S_k)
+        Lexical Layer Retrieval (Section 3.3)
+        R_lex = Top-n(BM25(q_lex, m_i))
         """
         keywords = query_analysis.get("keywords", [])
         if not keywords:
@@ -259,10 +263,8 @@ Return ONLY JSON, no other content.
 
     def _structured_search(self, query_analysis: Dict[str, Any]) -> List[MemoryEntry]:
         """
-        Symbolic Layer Retrieval
-
-        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
-        Hard filter based on symbolic constraints: γ · 𝕀(R_k ⊨ C_meta)
+        Symbolic Layer Retrieval (Section 3.3)
+        R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
         """
         persons = query_analysis.get("persons", [])
         location = query_analysis.get("location")
@@ -647,11 +649,8 @@ Return ONLY the JSON, no other text.
     
     def _analyze_information_requirements(self, query: str) -> Dict[str, Any]:
         """
-        Query Complexity Estimation C_q
-
-        Paper Reference: Section 3.3 - Eq. (8)
-        Analyzes query complexity to determine minimal information requirements
-        and optimal retrieval depth k_dyn
+        Retrieval Planning (Section 3.3)
+        Analyzes query to determine information requirements and retrieval depth d
         """
         prompt = f"""
 Analyze the following question and determine what specific information is required to answer it comprehensively.

@@ -125,7 +125,7 @@ Infers search intent to dynamically determine retrieval scope and construct prec
 
 ### 1️⃣ Semantic Structured Compression
 
-SimpleMem applies a **semantic density gating** mechanism via LLM-based qualitative assessment to filter redundant interaction content. The system reformulates raw dialogue streams into **compact memory units** — self-contained facts with resolved coreferences and absolute timestamps. Each unit is indexed through three complementary representations for flexible retrieval:
+SimpleMem applies an **implicit semantic density gating** mechanism integrated into the LLM generation process to filter redundant interaction content. The system reformulates raw dialogue streams into **compact memory units** — self-contained facts with resolved coreferences and absolute timestamps. Each unit is indexed through three complementary representations for flexible retrieval:
 
 <div align="center">
 
