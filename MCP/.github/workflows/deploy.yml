@@ -1,0 +1,128 @@
+# GitHub Actions Workflow for SimpleMem MCP Server
+# Handles CI/CD pipeline with DigitalOcean App Platform
+#
+# Required secrets (set in GitHub repo settings):
+#   - DIGITALOCEAN_ACCESS_TOKEN: DigitalOcean API token
+#   - DO_APP_ID: DigitalOcean App Platform app ID (optional, for direct deployment)
+
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'MCP/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'MCP/**'
+  workflow_dispatch:
+
+jobs:
+  # Run tests and linting
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: MCP
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'MCP/requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run linting (optional)
+        run: |
+          pip install ruff
+          ruff check . --ignore E501
+        continue-on-error: true
+
+      - name: Run type checking (optional)
+        run: |
+          pip install pyright
+          pyright --verifytypes server || true
+        continue-on-error: true
+
+      - name: Run tests
+        run: |
+          if [ -d "tests" ]; then
+            pip install pytest
+            pytest tests/ -v
+          else
+            echo "No tests directory found, skipping tests"
+          fi
+
+  # Build Docker image and verify it works
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./MCP
+          file: ./MCP/Dockerfile
+          push: false
+          tags: simplemem-mcp:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy to DigitalOcean App Platform
+  # This job only runs on pushes to main (not PRs)
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Option 1: Trigger deployment via DigitalOcean CLI
+      # Requires DIGITALOCEAN_ACCESS_TOKEN and DO_APP_ID secrets
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        if: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN != '' }}
+
+      - name: Trigger DigitalOcean App Platform deployment
+        run: |
+          if [ -n "${{ secrets.DO_APP_ID }}" ]; then
+            doctl apps create-deployment ${{ secrets.DO_APP_ID }} --wait
+          else
+            echo "DO_APP_ID not set - deployment will be triggered automatically by App Platform's GitHub integration"
+          fi
+        if: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN != '' }}
+
+      # Option 2: If using App Platform's built-in GitHub integration,
+      # deployment is triggered automatically on push to main.
+      # This step just logs that the deployment should happen.
+      - name: Deployment notification
+        run: |
+          echo "Code pushed to main branch."
+          echo "If App Platform GitHub integration is configured, deployment will start automatically."
+          echo "Check your DigitalOcean dashboard for deployment status."

@@ -1,16 +1,23 @@
 """
-Multi-tenant vector store for SimpleMem MCP Server
-Uses LanceDB for vector storage with per-user table isolation
+Single-tenant vector store for SimpleMem MCP Server
+Uses LanceDB with S3-compatible storage (DigitalOcean Spaces)
 """
 
-import os
+import re
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 import lancedb
+import pandas as pd
 import pyarrow as pa
 
 from ..auth.models import MemoryEntry
+
+# UUID validation pattern (standard UUID format)
+UUID_PATTERN = re.compile(
+    r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
+    re.IGNORECASE
+)
 
 
 # LanceDB schema for memory entries
@@ -30,52 +37,57 @@ def get_memory_schema(embedding_dimension: int = 2560) -> pa.Schema:
     ])
 
 
-class MultiTenantVectorStore:
+class SingleTenantVectorStore:
     """
-    Multi-tenant vector storage with per-user table isolation.
-    Each user gets their own LanceDB table for complete data isolation.
+    Single-tenant vector storage with S3-compatible backend.
+    Uses a single LanceDB table for all memories.
     """
 
     def __init__(
         self,
-        db_path: str = "./data/lancedb",
+        s3_path: str,
+        storage_options: Dict[str, str],
+        table_name: str = "memories",
         embedding_dimension: int = 2560,
     ):
-        self.db_path = db_path
+        """
+        Initialize single-tenant vector store with S3 storage.
+
+        Args:
+            s3_path: S3 path for LanceDB (e.g., "s3://bucket-name/lancedb")
+            storage_options: S3 credentials and configuration
+            table_name: Name of the memories table (default: "memories")
+            embedding_dimension: Dimension of embedding vectors (default: 2560)
+        """
+        self.s3_path = s3_path
+        self.storage_options = storage_options
+        self.table_name = table_name
         self.embedding_dimension = embedding_dimension
-        os.makedirs(db_path, exist_ok=True)
+        self._table = None
 
-        # Connect to LanceDB
-        self.db = lancedb.connect(db_path)
+        # Connect to LanceDB with S3 storage
+        self.db = lancedb.connect(s3_path, storage_options=storage_options)
 
-        # Cache for opened tables
-        self._tables: Dict[str, Any] = {}
-
-    def _get_table(self, table_name: str) -> Any:
-        """Get or create a user's table"""
-        if table_name not in self._tables:
-            if table_name in self.db.table_names():
-                self._tables[table_name] = self.db.open_table(table_name)
+    def _get_table(self) -> Any:
+        """Get or create the memories table"""
+        if self._table is None:
+            if self.table_name in self.db.table_names():
+                self._table = self.db.open_table(self.table_name)
             else:
                 # Create new table with schema
                 schema = get_memory_schema(self.embedding_dimension)
-                self._tables[table_name] = self.db.create_table(
-                    table_name,
-                    schema=schema,
-                )
-        return self._tables[table_name]
+                self._table = self.db.create_table(self.table_name, schema=schema)
+        return self._table
 
     async def add_entries(
         self,
-        table_name: str,
         entries: List[MemoryEntry],
         embeddings: List[List[float]],
     ) -> int:
         """
-        Add memory entries to a user's table
+        Add memory entries to the table
 
         Args:
-            table_name: User's table name
             entries: List of MemoryEntry objects
             embeddings: List of embedding vectors
 
@@ -88,7 +100,7 @@ class MultiTenantVectorStore:
         if not entries:
             return 0
 
-        table = self._get_table(table_name)
+        table = self._get_table()
         created_at = datetime.utcnow().isoformat()
 
         # Build records
@@ -113,7 +125,6 @@ class MultiTenantVectorStore:
 
     async def semantic_search(
         self,
-        table_name: str,
         query_embedding: List[float],
         top_k: int = 25,
     ) -> List[MemoryEntry]:
@@ -121,14 +132,13 @@ class MultiTenantVectorStore:
         Perform semantic search using vector similarity
 
         Args:
-            table_name: User's table name
             query_embedding: Query embedding vector
             top_k: Number of results to return
 
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = self._get_table()
 
         try:
             # Check if table has data
@@ -162,7 +172,6 @@ class MultiTenantVectorStore:
 
     async def keyword_search(
         self,
-        table_name: str,
         keywords: List[str],
         top_k: int = 5,
     ) -> List[MemoryEntry]:
@@ -170,14 +179,13 @@ class MultiTenantVectorStore:
         Perform keyword-based search (BM25-style matching)
 
         Args:
-            table_name: User's table name
             keywords: List of keywords to match
             top_k: Number of results to return
 
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = self._get_table()
 
         try:
             if table.count_rows() == 0:
@@ -230,7 +238,6 @@ class MultiTenantVectorStore:
 
     async def structured_search(
         self,
-        table_name: str,
         persons: Optional[List[str]] = None,
         location: Optional[str] = None,
         entities: Optional[List[str]] = None,
@@ -242,7 +249,6 @@ class MultiTenantVectorStore:
         Perform structured/metadata-based search
 
         Args:
-            table_name: User's table name
             persons: Filter by person names
             location: Filter by location
             entities: Filter by entities
@@ -253,7 +259,7 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = self._get_table()
 
         try:
             if table.count_rows() == 0:
@@ -322,9 +328,9 @@ class MultiTenantVectorStore:
             print(f"Structured search error: {e}")
             return []
 
-    async def get_all_entries(self, table_name: str) -> List[MemoryEntry]:
-        """Get all entries from a user's table"""
-        table = self._get_table(table_name)
+    async def get_all_entries(self) -> List[MemoryEntry]:
+        """Get all entries from the table"""
+        table = self._get_table()
 
         try:
             if table.count_rows() == 0:
@@ -333,16 +339,37 @@ class MultiTenantVectorStore:
             df = table.to_pandas()
             entries = []
 
+            # Check if created_at column exists (may not exist in older tables)
+            has_created_at = "created_at" in df.columns
+
             for _, row in df.iterrows():
+                # Helper to safely get values (handles pandas NA/NaN)
+                def safe_get(val):
+                    return val if pd.notna(val) else None
+
+                def safe_get_list(val):
+                    if val is None or (hasattr(val, '__iter__') and pd.isna(val).any() if hasattr(pd.isna(val), 'any') else pd.isna(val)):
+                        return []
+                    return list(val) if val is not None else []
+
+                # Safely get created_at value
+                created_at_val = None
+                if has_created_at:
+                    try:
+                        created_at_val = safe_get(row["created_at"])
+                    except Exception:
+                        created_at_val = None
+
                 entries.append(MemoryEntry(
-                    entry_id=row["entry_id"],
-                    lossless_restatement=row["lossless_restatement"],
-                    keywords=list(row["keywords"]) if row["keywords"] is not None else [],
-                    timestamp=row["timestamp"] if row["timestamp"] else None,
-                    location=row["location"] if row["location"] else None,
-                    persons=list(row["persons"]) if row["persons"] is not None else [],
-                    entities=list(row["entities"]) if row["entities"] is not None else [],
-                    topic=row["topic"] if row["topic"] else None,
+                    entry_id=safe_get(row["entry_id"]) or "",
+                    lossless_restatement=safe_get(row["lossless_restatement"]) or "",
+                    keywords=safe_get_list(row["keywords"]),
+                    timestamp=safe_get(row["timestamp"]),
+                    location=safe_get(row["location"]),
+                    persons=safe_get_list(row["persons"]),
+                    entities=safe_get_list(row["entities"]),
+                    topic=safe_get(row["topic"]),
+                    created_at=created_at_val,
                 ))
 
             return entries
@@ -351,61 +378,154 @@ class MultiTenantVectorStore:
             print(f"Get all entries error: {e}")
             return []
 
-    async def count_entries(self, table_name: str) -> int:
-        """Count entries in a user's table"""
-        table = self._get_table(table_name)
+    async def count_entries(self) -> int:
+        """Count entries in the table"""
+        table = self._get_table()
         try:
             return table.count_rows()
         except Exception:
             return 0
 
-    async def clear_table(self, table_name: str) -> bool:
-        """Clear all entries from a user's table"""
+    async def clear_table(self) -> bool:
+        """Clear all entries from the table"""
         try:
-            if table_name in self._tables:
-                del self._tables[table_name]
+            self._table = None
 
-            if table_name in self.db.table_names():
-                self.db.drop_table(table_name)
+            if self.table_name in self.db.table_names():
+                self.db.drop_table(self.table_name)
 
             # Recreate empty table
-            self._get_table(table_name)
+            self._get_table()
             return True
 
         except Exception as e:
             print(f"Clear table error: {e}")
             return False
 
-    async def delete_table(self, table_name: str) -> bool:
-        """Completely delete a user's table"""
+    async def delete_entries(self, entry_ids: List[str]) -> int:
+        """Delete specific entries by their IDs
+
+        Args:
+            entry_ids: List of entry IDs to delete
+
+        Returns:
+            Number of entries deleted
+
+        Raises:
+            ValueError: If any entry_id is not a valid UUID format
+        """
+        if not entry_ids:
+            return 0
+
+        # Validate all entry IDs are valid UUIDs to prevent injection
+        for eid in entry_ids:
+            if not UUID_PATTERN.match(eid):
+                raise ValueError(f"Invalid entry_id format (must be UUID): {eid}")
+
+        table = self._get_table()
         try:
-            if table_name in self._tables:
-                del self._tables[table_name]
+            # Build WHERE clause for deletion
+            # LanceDB uses SQL-like syntax for deletion
+            # Entry IDs are validated as UUIDs above, safe to interpolate
+            placeholders = ", ".join([f"'{eid}'" for eid in entry_ids])
+            where_clause = f"entry_id IN ({placeholders})"
 
-            if table_name in self.db.table_names():
-                self.db.drop_table(table_name)
+            before_count = table.count_rows()
+            table.delete(where_clause)
+            after_count = table.count_rows()
 
-            return True
+            return before_count - after_count
 
         except Exception as e:
-            print(f"Delete table error: {e}")
-            return False
+            print(f"Delete entries error: {e}")
+            return 0
 
-    def get_stats(self, table_name: str) -> Dict[str, Any]:
-        """Get statistics for a user's table"""
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics for the table"""
         try:
-            table = self._get_table(table_name)
+            table = self._get_table()
             count = table.count_rows()
 
             return {
-                "table_name": table_name,
+                "mode": "single-tenant",
+                "table_name": self.table_name,
                 "entry_count": count,
                 "embedding_dimension": self.embedding_dimension,
+                "storage": "S3",
+                "s3_path": self.s3_path,
             }
         except Exception as e:
             return {
-                "table_name": table_name,
+                "mode": "single-tenant",
+                "table_name": self.table_name,
                 "entry_count": 0,
                 "embedding_dimension": self.embedding_dimension,
+                "storage": "S3",
+                "s3_path": self.s3_path,
                 "error": str(e),
             }
+
+    def test_connection(self) -> tuple[bool, str]:
+        """
+        Test S3 connection by listing tables.
+
+        Returns:
+            Tuple of (success, message)
+        """
+        try:
+            _ = self.db.table_names()
+            return True, "S3 connection successful"
+        except Exception as e:
+            return False, f"S3 connection failed: {str(e)}"
+
+
+# =============================================================================
+# MULTI-TENANT VECTOR STORE (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# class MultiTenantVectorStore:
+#     """
+#     Multi-tenant vector storage with per-user table isolation.
+#     Each user gets their own LanceDB table for complete data isolation.
+#     """
+#
+#     def __init__(
+#         self,
+#         db_path: str = "./data/lancedb",
+#         embedding_dimension: int = 2560,
+#     ):
+#         self.db_path = db_path
+#         self.embedding_dimension = embedding_dimension
+#         os.makedirs(db_path, exist_ok=True)
+#
+#         # Connect to LanceDB (local path)
+#         self.db = lancedb.connect(db_path)
+#
+#         # Cache for opened tables
+#         self._tables: Dict[str, Any] = {}
+#
+#     def _get_table(self, table_name: str) -> Any:
+#         """Get or create a user's table"""
+#         if table_name not in self._tables:
+#             if table_name in self.db.table_names():
+#                 self._tables[table_name] = self.db.open_table(table_name)
+#             else:
+#                 schema = get_memory_schema(self.embedding_dimension)
+#                 self._tables[table_name] = self.db.create_table(
+#                     table_name,
+#                     schema=schema,
+#                 )
+#         return self._tables[table_name]
+#
+#     # All methods had table_name as first parameter:
+#     # async def add_entries(self, table_name: str, entries, embeddings)
+#     # async def semantic_search(self, table_name: str, query_embedding, top_k)
+#     # async def keyword_search(self, table_name: str, keywords, top_k)
+#     # async def structured_search(self, table_name: str, persons, location, ...)
+#     # async def get_all_entries(self, table_name: str)
+#     # async def count_entries(self, table_name: str)
+#     # async def clear_table(self, table_name: str)
+#     # async def delete_table(self, table_name: str)
+#     # def get_stats(self, table_name: str)
+# =============================================================================

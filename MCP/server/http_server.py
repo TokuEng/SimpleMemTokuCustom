@@ -1,70 +1,54 @@
 """
-HTTP Server for SimpleMem MCP
+HTTP Server for SimpleMem MCP - Single Tenant Mode
 
 Provides:
-- User registration and authentication (/api/auth/*)
 - MCP over Streamable HTTP (2025-03-26 spec) (/mcp)
-- Legacy MCP over SSE for backwards compatibility (/mcp/sse)
+- Health and info endpoints (/api/*)
 - Static frontend for configuration (/)
+- S3-backed LanceDB storage
 
 Streamable HTTP Transport:
 - Single endpoint /mcp supporting POST, GET, DELETE
-- Authentication via Authorization: Bearer <token> header
+- Optional authentication via Authorization: Bearer <token> header
 - Session management via Mcp-Session-Id header
 - Supports both JSON and SSE response formats
 """
 
 import asyncio
+import html
 import json
+import logging
 import os
-import uuid
+import re
 import secrets
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header, Response
+from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
 
-from .auth.token_manager import TokenManager
-from .auth.models import User
-from .database.user_store import UserStore
-from .database.vector_store import MultiTenantVectorStore
-from .integrations.openrouter import OpenRouterClient, OpenRouterClientManager
+from .auth.token_manager import SimpleAuthManager
+from .database.vector_store import SingleTenantVectorStore
+from .integrations.openrouter import OpenRouterClient
 from .mcp_handler import MCPHandler
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import get_settings
 
-
-# === Pydantic Models ===
-
-class RegisterRequest(BaseModel):
-    openrouter_api_key: str
-
-
-class RegisterResponse(BaseModel):
-    success: bool
-    token: Optional[str] = None
-    user_id: Optional[str] = None
-    mcp_endpoint: Optional[str] = None
-    error: Optional[str] = None
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 # === Session Management ===
 
 @dataclass
 class MCPSession:
-    """Represents an active MCP session"""
+    """Represents an active MCP session (single-tenant)"""
     session_id: str
-    user_id: str
-    user: User
-    api_key: str
     handler: MCPHandler
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_active: datetime = field(default_factory=datetime.utcnow)
@@ -93,21 +77,32 @@ SESSION_EXPIRY_MINUTES = 30
 # === Global Instances ===
 
 settings = get_settings()
-user_store = UserStore(settings.user_db_path)
-vector_store = MultiTenantVectorStore(settings.lancedb_path, settings.embedding_dimension)
-token_manager = TokenManager(
-    secret_key=settings.jwt_secret_key,
-    encryption_key=settings.encryption_key,
-    expiration_days=settings.jwt_expiration_days,
-)
-client_manager = OpenRouterClientManager(
+
+# Single OpenRouter client using server-side API key
+openrouter_client = OpenRouterClient(
+    api_key=settings.openrouter_api_key,
     base_url=settings.openrouter_base_url,
     llm_model=settings.llm_model,
     embedding_model=settings.embedding_model,
 )
 
-# Store active MCP handlers per user (legacy)
-_mcp_handlers: dict[str, MCPHandler] = {}
+# Single vector store with S3 backend
+vector_store = SingleTenantVectorStore(
+    s3_path=settings.lancedb_path,
+    storage_options=settings.get_s3_storage_options(),
+    table_name=settings.table_name,
+    embedding_dimension=settings.embedding_dimension,
+)
+
+# Simple auth manager
+auth_manager = SimpleAuthManager(settings.simplemem_access_key)
+
+# Single global MCP handler (initialized at module load for thread safety)
+mcp_handler = MCPHandler(
+    openrouter_client=openrouter_client,
+    vector_store=vector_store,
+    settings=settings,
+)
 
 # Store active sessions by session_id
 _sessions: dict[str, MCPSession] = {}
@@ -144,29 +139,19 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def get_or_create_session(user: User, api_key: str, session_id: Optional[str] = None) -> MCPSession:
-    """Get existing session or create new one"""
+async def get_or_create_session(session_id: Optional[str] = None) -> MCPSession:
+    """Get existing session or create new one (single-tenant)"""
     async with _session_lock:
         if session_id and session_id in _sessions:
             session = _sessions[session_id]
             session.touch()
             return session
 
-        # Create new session
+        # Create new session with shared handler
         new_session_id = generate_session_id()
-        handler = MCPHandler(
-            user=user,
-            api_key=api_key,
-            vector_store=vector_store,
-            client_manager=client_manager,
-            settings=settings,
-        )
         session = MCPSession(
             session_id=new_session_id,
-            user_id=user.user_id,
-            user=user,
-            api_key=api_key,
-            handler=handler,
+            handler=mcp_handler,
         )
         _sessions[new_session_id] = session
         return session
@@ -192,12 +177,15 @@ async def delete_session(session_id: str) -> bool:
 
 # === Authentication Helper ===
 
-async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
+async def verify_bearer_token(authorization: Optional[str]) -> bool:
     """
-    Verify Bearer token from Authorization header.
-    Returns (user, api_key) tuple.
+    Verify Bearer token for single-tenant mode.
+    Returns True if valid or auth disabled.
     Raises HTTPException on failure.
     """
+    if not auth_manager.auth_enabled:
+        return True
+
     if not authorization:
         raise HTTPException(
             status_code=401,
@@ -214,20 +202,15 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
         )
 
     token = parts[1]
-    is_valid, payload, error = token_manager.verify_token(token)
+    is_valid, error = auth_manager.verify_token(token)
     if not is_valid:
         raise HTTPException(
             status_code=401,
-            detail=f"Invalid token: {error}",
+            detail=error,
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-    return user, api_key
+    return True
 
 
 # === Lifecycle ===
@@ -235,11 +218,23 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for the app"""
-    print("SimpleMem MCP Server started")
-    print(f"  - LLM Model: {settings.llm_model}")
-    print(f"  - Embedding Model: {settings.embedding_model}")
-    print(f"  - Window Size: {settings.window_size}")
-    print(f"  - Transport: Streamable HTTP (2025-03-26)")
+    print("=" * 60)
+    print("  SimpleMem MCP Server (Single-Tenant)")
+    print("  S3-backed Memory Service for LLM Agents")
+    print("=" * 60)
+    print()
+    print(f"  LLM Model: {settings.llm_model}")
+    print(f"  Embedding Model: {settings.embedding_model}")
+    print(f"  S3 Bucket: {settings.s3_bucket}")
+    print(f"  Auth: {'Enabled' if auth_manager.auth_enabled else 'Disabled'}")
+    print(f"  Transport: Streamable HTTP (2025-03-26)")
+    print()
+
+    # Test S3 connection
+    s3_ok, s3_msg = vector_store.test_connection()
+    print(f"  S3 Connection: {s3_msg}")
+    print()
+    print("-" * 60)
 
     # Start session cleanup task
     cleanup_task = asyncio.create_task(session_cleanup_task())
@@ -253,6 +248,9 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Close OpenRouter client
+    await openrouter_client.close()
+
     print("SimpleMem MCP Server stopped")
 
 
@@ -260,7 +258,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SimpleMem MCP Server",
-    description="Multi-tenant Memory Service for LLM Agents",
+    description="Single-Tenant Memory Service for LLM Agents with S3 Storage",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -274,100 +272,18 @@ app.add_middleware(
 )
 
 
-# === Authentication Endpoints ===
-
-@app.post("/api/auth/register", response_model=RegisterResponse)
-async def register(request: RegisterRequest):
-    """Register a new user with OpenRouter API key"""
-    try:
-        # Validate API key with OpenRouter
-        client = OpenRouterClient(
-            api_key=request.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-        )
-        is_valid, error = await client.verify_api_key()
-        await client.close()
-
-        if not is_valid:
-            return RegisterResponse(
-                success=False,
-                error=f"Invalid OpenRouter API key: {error}",
-            )
-
-        # Create user
-        user = User()
-        user.openrouter_api_key_encrypted = token_manager.encrypt_api_key(
-            request.openrouter_api_key
-        )
-
-        # Save user
-        user_store.create_user(user)
-
-        # Generate token
-        token = token_manager.generate_token(user)
-
-        # Base URL for MCP endpoint (can be overridden via env)
-        base_url = os.getenv("MCP_BASE_URL", "")
-        mcp_endpoint = f"{base_url}/mcp" if base_url else "/mcp"
-
-        return RegisterResponse(
-            success=True,
-            token=token,
-            user_id=user.user_id,
-            mcp_endpoint=mcp_endpoint,  # Streamable HTTP endpoint
-        )
-
-    except Exception as e:
-        return RegisterResponse(
-            success=False,
-            error=str(e),
-        )
-
-
-@app.get("/api/auth/verify")
-async def verify_token(token: str = Query(..., description="Token to verify")):
-    """Verify token is valid"""
-    is_valid, payload, error = token_manager.verify_token(token)
-    if not is_valid:
-        raise HTTPException(status_code=401, detail=error)
-
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return {
-        "valid": True,
-        "user_id": user.user_id,
-    }
-
-
-@app.post("/api/auth/refresh")
-async def refresh_token(token: str = Query(..., description="Token to refresh")):
-    """Refresh authentication token"""
-    is_valid, payload, error = token_manager.verify_token(token)
-    if not is_valid:
-        raise HTTPException(status_code=401, detail=error)
-
-    user = user_store.get_user(payload.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    new_token = token_manager.generate_token(user)
-    return {
-        "success": True,
-        "token": new_token,
-    }
-
-
 # === Health & Info ===
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with S3 connectivity test"""
+    s3_ok, s3_msg = vector_store.test_connection()
+
     return {
-        "status": "healthy",
+        "status": "healthy" if s3_ok else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
+        "s3_storage": "connected" if s3_ok else f"error: {s3_msg}",
     }
 
 
@@ -377,30 +293,19 @@ async def server_info():
     return {
         "name": "SimpleMem MCP Server",
         "version": "1.0.0",
+        "mode": "single-tenant",
         "protocol_version": "2025-03-26",
         "transport": "Streamable HTTP",
+        "storage": "S3",
+        "s3_bucket": settings.s3_bucket,
         "llm_model": settings.llm_model,
         "embedding_model": settings.embedding_model,
-        "window_size": settings.window_size,
+        "auth_enabled": auth_manager.auth_enabled,
         "active_sessions": len(_sessions),
-        "total_users": user_store.count_users(),
     }
 
 
-# === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===
-
-def _get_mcp_handler(user: User, api_key: str) -> MCPHandler:
-    """Get or create MCP handler for user (legacy)"""
-    if user.user_id not in _mcp_handlers:
-        _mcp_handlers[user.user_id] = MCPHandler(
-            user=user,
-            api_key=api_key,
-            vector_store=vector_store,
-            client_manager=client_manager,
-            settings=settings,
-        )
-    return _mcp_handlers[user.user_id]
-
+# === MCP Protocol Helper Functions ===
 
 def _is_initialize_request(data: dict | list) -> bool:
     """Check if the message is an initialize request"""
@@ -426,6 +331,8 @@ def _is_notification_or_response_only(data: dict | list) -> bool:
     return True
 
 
+# === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===
+
 @app.post("/mcp")
 async def mcp_post_endpoint(
     request: Request,
@@ -438,7 +345,7 @@ async def mcp_post_endpoint(
     Handles JSON-RPC 2.0 messages from clients.
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Accept: application/json, text/event-stream (required)
     - Mcp-Session-Id: <session-id> (required after initialization)
 
@@ -457,8 +364,7 @@ async def mcp_post_endpoint(
         )
 
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
-    user_store.update_last_active(user.user_id)
+    await verify_bearer_token(authorization)
 
     # Parse request body
     try:
@@ -475,7 +381,7 @@ async def mcp_post_endpoint(
 
     # Handle initialization (creates new session)
     if _is_initialize_request(data):
-        session = await get_or_create_session(user, api_key)
+        session = await get_or_create_session()
         session.initialized = True
 
         # Process the initialize request
@@ -488,24 +394,22 @@ async def mcp_post_endpoint(
             headers={"Mcp-Session-Id": session.session_id},
         )
 
-    # For non-initialization requests, session ID is required
-    if not mcp_session_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Mcp-Session-Id header required for non-initialization requests",
-        )
+    # For non-initialization requests, try to get existing session or create new one
+    session = None
+    if mcp_session_id:
+        session = await get_session(mcp_session_id)
 
-    # Get existing session
-    session = await get_session(mcp_session_id)
+    # Auto-create session if not found (resilient mode)
+    # This handles cases where session expired or server restarted
+    session_recreated = False
     if not session:
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found or expired. Send new InitializeRequest.",
+        session = await get_or_create_session()
+        session.initialized = True  # Mark as initialized since client already initialized
+        session_recreated = True
+        logger.warning(
+            f"Session not found or expired, created new session {session.session_id} "
+            f"(previous session_id: {mcp_session_id or 'none'})"
         )
-
-    # Verify session belongs to this user
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
 
     # If only notifications or responses, return 202 Accepted
     if _is_notification_or_response_only(data):
@@ -514,13 +418,17 @@ async def mcp_post_endpoint(
         return Response(status_code=202)
 
     # Process request(s) and return response
-    # For now, we return JSON. SSE streaming can be added for long-running tools.
     response_str = await session.handler.handle_message(json.dumps(data))
     response_data = json.loads(response_str)
 
+    # Build response headers
+    response_headers = {"Mcp-Session-Id": session.session_id}
+    if session_recreated:
+        response_headers["X-Session-Recreated"] = "true"
+
     return JSONResponse(
         content=response_data,
-        headers={"Mcp-Session-Id": session.session_id},
+        headers=response_headers,
     )
 
 
@@ -537,7 +445,7 @@ async def mcp_get_endpoint(
     Used for server-initiated messages (notifications, requests to client).
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Accept: text/event-stream (required)
     - Mcp-Session-Id: <session-id> (required)
     - Last-Event-ID: <event-id> (optional, for resumability)
@@ -551,7 +459,7 @@ async def mcp_get_endpoint(
         )
 
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
+    await verify_bearer_token(authorization)
 
     # Session ID required for GET
     if not mcp_session_id:
@@ -567,10 +475,6 @@ async def mcp_get_endpoint(
             status_code=404,
             detail="Session not found or expired",
         )
-
-    # Verify session belongs to this user
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
 
     # Generate unique stream ID
     stream_id = secrets.token_urlsafe(16)
@@ -625,165 +529,932 @@ async def mcp_delete_endpoint(
     Terminate an MCP session.
 
     Headers:
-    - Authorization: Bearer <token> (required)
+    - Authorization: Bearer <token> (required if SIMPLEMEM_ACCESS_KEY is set)
     - Mcp-Session-Id: <session-id> (required)
     """
     # Authenticate
-    user, api_key = await verify_bearer_token(authorization)
+    await verify_bearer_token(authorization)
 
     if not mcp_session_id:
         raise HTTPException(status_code=400, detail="Mcp-Session-Id header required")
 
-    # Get session to verify ownership
+    # Get session to verify it exists
     session = await get_session(mcp_session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
 
     # Delete session
     await delete_session(mcp_session_id)
     return Response(status_code=204)
 
 
-# === Legacy MCP Endpoints (HTTP+SSE - 2024-11-05 spec) ===
-# Kept for backwards compatibility with older clients
+# === Memory Viewer Dashboard ===
 
-@app.get("/mcp/sse")
-async def mcp_sse_endpoint_legacy(
-    request: Request,
-    token: Optional[str] = Query(None, description="Authentication token (legacy)"),
-    authorization: Optional[str] = Header(None),
-):
+@app.get("/memories", response_class=HTMLResponse)
+async def memory_viewer():
+    """Memory Viewer Dashboard - View all stored memories"""
+    s3_ok, _ = vector_store.test_connection()
+
+    # Get all entries for display (this is the source of truth)
+    try:
+        entries = await vector_store.get_all_entries()
+        # Use actual entries count, not cached stats
+        entry_count = len(entries)
+
+        # Collect unique values for filters (escaped for safe HTML output)
+        all_topics = set()
+        all_persons = set()
+        all_entities = set()
+        for e in entries:
+            if e.topic:
+                all_topics.add(html.escape(e.topic))
+            for p in (e.persons or []):
+                all_persons.add(html.escape(p))
+            for ent in (e.entities or []):
+                all_entities.add(html.escape(ent))
+
+        entries_data = [
+            {
+                # Escape all user-provided content to prevent XSS attacks
+                "entry_id": html.escape(e.entry_id) if e.entry_id else "",
+                "content": html.escape(e.lossless_restatement) if e.lossless_restatement else "",
+                "timestamp": html.escape(e.timestamp) if e.timestamp else "—",
+                "created_at": html.escape(e.created_at) if e.created_at else "—",
+                "location": html.escape(e.location) if e.location else "—",
+                "persons": html.escape(", ".join(e.persons)) if e.persons else "—",
+                "persons_list": [html.escape(p) for p in (e.persons or [])],
+                "entities": html.escape(", ".join(e.entities)) if e.entities else "—",
+                "entities_list": [html.escape(ent) for ent in (e.entities or [])],
+                "topic": html.escape(e.topic) if e.topic else "—",
+                "keywords": html.escape(", ".join(e.keywords)) if e.keywords else "—",
+            }
+            for e in entries
+        ]
+    except Exception as ex:
+        entries_data = []
+        entry_count = 0
+        all_topics = set()
+        all_persons = set()
+        all_entities = set()
+        print(f"Error loading entries: {ex}")
+
+    # Build memory cards HTML
+    memory_cards = ""
+    for i, entry in enumerate(entries_data):
+        # Convert lists to JSON for data attributes
+        persons_json = json.dumps(entry["persons_list"])
+        entities_json = json.dumps(entry["entities_list"])
+        memory_cards += f'''
+        <div class="memory-card" data-index="{i}" data-entry-id="{entry["entry_id"]}" data-topic="{entry["topic"]}" data-persons='{persons_json}' data-entities='{entities_json}'>
+            <div class="card-header">
+                <input type="checkbox" class="memory-checkbox" data-entry-id="{entry["entry_id"]}" onchange="updateSelectionCount()">
+                <span class="card-index">#{i + 1}</span>
+            </div>
+            <div class="memory-content">{entry["content"]}</div>
+            <div class="memory-meta">
+                <div class="meta-row">
+                    <span class="meta-label">Event Time:</span>
+                    <span class="meta-value">{entry["timestamp"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Stored:</span>
+                    <span class="meta-value">{entry["created_at"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Persons:</span>
+                    <span class="meta-value tag-list">{entry["persons"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Location:</span>
+                    <span class="meta-value">{entry["location"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Entities:</span>
+                    <span class="meta-value">{entry["entities"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Topic:</span>
+                    <span class="meta-value topic">{entry["topic"]}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Keywords:</span>
+                    <span class="meta-value tag-list">{entry["keywords"]}</span>
+                </div>
+            </div>
+        </div>
+        '''
+
+    if not memory_cards:
+        memory_cards = '''
+        <div class="empty-state">
+            <div class="empty-icon">🧠</div>
+            <h3>No Memories Yet</h3>
+            <p>Start storing memories using the MCP tools:</p>
+            <code>memory_add(speaker="user", content="Your information here")</code>
+        </div>
+        '''
+
+    page_html = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SimpleMem - Memory Viewer</title>
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #e4e4e7;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 24px;
+            }}
+            header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 32px;
+                flex-wrap: wrap;
+                gap: 16px;
+            }}
+            .logo {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }}
+            .logo h1 {{
+                font-size: 28px;
+                font-weight: 700;
+                background: linear-gradient(135deg, #60a5fa, #a78bfa);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }}
+            .logo-icon {{
+                font-size: 32px;
+            }}
+            nav {{
+                display: flex;
+                gap: 12px;
+            }}
+            nav a {{
+                color: #a1a1aa;
+                text-decoration: none;
+                padding: 8px 16px;
+                border-radius: 8px;
+                transition: all 0.2s;
+            }}
+            nav a:hover, nav a.active {{
+                color: #fff;
+                background: rgba(255,255,255,0.1);
+            }}
+
+            /* Stats Bar */
+            .stats-bar {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 16px;
+                margin-bottom: 24px;
+            }}
+            .stat-card {{
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+                padding: 20px;
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 36px;
+                font-weight: 700;
+                background: linear-gradient(135deg, #60a5fa, #34d399);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }}
+            .stat-label {{
+                color: #a1a1aa;
+                font-size: 14px;
+                margin-top: 4px;
+            }}
+            .stat-sublabel {{
+                color: #52525b;
+                font-size: 11px;
+                margin-top: 2px;
+                font-style: italic;
+            }}
+            .stat-card.status .stat-value {{
+                font-size: 18px;
+                background: none;
+                -webkit-text-fill-color: {"#22c55e" if s3_ok else "#ef4444"};
+            }}
+            .stat-value.small {{
+                font-size: 14px;
+                word-break: break-all;
+            }}
+
+            /* Controls */
+            .controls {{
+                display: flex;
+                gap: 12px;
+                margin-bottom: 24px;
+                flex-wrap: wrap;
+            }}
+            .search-box {{
+                flex: 1;
+                min-width: 250px;
+                position: relative;
+            }}
+            .search-box input {{
+                width: 100%;
+                padding: 12px 16px 12px 44px;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 10px;
+                background: rgba(255,255,255,0.05);
+                color: #fff;
+                font-size: 15px;
+                transition: all 0.2s;
+            }}
+            .search-box input:focus {{
+                outline: none;
+                border-color: #60a5fa;
+                background: rgba(255,255,255,0.08);
+            }}
+            .search-box::before {{
+                content: "🔍";
+                position: absolute;
+                left: 14px;
+                top: 50%;
+                transform: translateY(-50%);
+                font-size: 16px;
+            }}
+            .btn {{
+                padding: 12px 20px;
+                border: none;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }}
+            .btn-primary {{
+                background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+                color: white;
+            }}
+            .btn-primary:hover {{
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+            }}
+            .btn-danger {{
+                background: rgba(239, 68, 68, 0.2);
+                color: #f87171;
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }}
+            .btn-danger:hover {{
+                background: rgba(239, 68, 68, 0.3);
+            }}
+            .btn-secondary {{
+                background: rgba(255, 255, 255, 0.1);
+                color: #a1a1aa;
+                border: 1px solid rgba(255,255,255,0.2);
+            }}
+            .btn-secondary:hover {{
+                background: rgba(255, 255, 255, 0.15);
+                color: #e4e4e7;
+            }}
+            .btn:disabled {{
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none !important;
+            }}
+
+            /* Filter Selects */
+            .filter-select {{
+                padding: 12px 16px;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 10px;
+                background: rgba(255,255,255,0.05);
+                color: #fff;
+                font-size: 14px;
+                cursor: pointer;
+                min-width: 140px;
+            }}
+            .filter-select:focus {{
+                outline: none;
+                border-color: #60a5fa;
+            }}
+            .filter-select option {{
+                background: #1a1a2e;
+                color: #fff;
+            }}
+
+            /* Selection Controls */
+            .selection-controls {{
+                display: flex;
+                gap: 12px;
+                margin-bottom: 16px;
+                align-items: center;
+                flex-wrap: wrap;
+                padding: 12px 16px;
+                background: rgba(255,255,255,0.03);
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.08);
+            }}
+            .select-all-label {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #a1a1aa;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            .select-all-label:hover {{
+                color: #e4e4e7;
+            }}
+            .selection-count {{
+                color: #60a5fa;
+                font-weight: 600;
+                font-size: 14px;
+                margin-left: auto;
+            }}
+
+            /* Card Header */
+            .card-header {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }}
+            .memory-checkbox {{
+                width: 18px;
+                height: 18px;
+                cursor: pointer;
+                accent-color: #60a5fa;
+            }}
+            .card-index {{
+                font-size: 12px;
+                color: #71717a;
+                font-weight: 600;
+            }}
+            .memory-card.selected {{
+                border-color: #60a5fa;
+                background: rgba(96, 165, 250, 0.1);
+            }}
+
+            /* Memory Grid */
+            .memory-grid {{
+                display: grid;
+                gap: 16px;
+            }}
+            .memory-card {{
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 16px;
+                padding: 24px;
+                transition: all 0.3s;
+            }}
+            .memory-card:hover {{
+                background: rgba(255,255,255,0.06);
+                border-color: rgba(96, 165, 250, 0.3);
+                transform: translateY(-2px);
+            }}
+            .memory-content {{
+                font-size: 16px;
+                line-height: 1.6;
+                color: #f4f4f5;
+                margin-bottom: 16px;
+                padding-bottom: 16px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                word-break: break-word;
+                overflow-wrap: break-word;
+            }}
+            .memory-meta {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 12px;
+            }}
+            .meta-row {{
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }}
+            .meta-label {{
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                color: #71717a;
+            }}
+            .meta-value {{
+                font-size: 14px;
+                color: #a1a1aa;
+                word-break: break-word;
+                overflow-wrap: break-word;
+            }}
+            .meta-value.tag-list {{
+                color: #60a5fa;
+            }}
+            .meta-value.topic {{
+                color: #a78bfa;
+            }}
+
+            /* Empty State */
+            .empty-state {{
+                text-align: center;
+                padding: 60px 20px;
+                background: rgba(255,255,255,0.02);
+                border: 2px dashed rgba(255,255,255,0.1);
+                border-radius: 16px;
+            }}
+            .empty-icon {{
+                font-size: 64px;
+                margin-bottom: 16px;
+            }}
+            .empty-state h3 {{
+                font-size: 24px;
+                margin-bottom: 8px;
+                color: #e4e4e7;
+            }}
+            .empty-state p {{
+                color: #71717a;
+                margin-bottom: 16px;
+            }}
+            .empty-state code {{
+                display: inline-block;
+                background: rgba(96, 165, 250, 0.1);
+                color: #60a5fa;
+                padding: 8px 16px;
+                border-radius: 8px;
+                font-size: 13px;
+            }}
+
+            /* Footer */
+            footer {{
+                margin-top: 48px;
+                padding-top: 24px;
+                border-top: 1px solid rgba(255,255,255,0.08);
+                text-align: center;
+                color: #52525b;
+                font-size: 13px;
+            }}
+            footer a {{
+                color: #60a5fa;
+                text-decoration: none;
+            }}
+
+            /* Modal */
+            .modal-overlay {{
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0,0,0,0.7);
+                z-index: 1000;
+                align-items: center;
+                justify-content: center;
+            }}
+            .modal-overlay.active {{
+                display: flex;
+            }}
+            .modal {{
+                background: #1e1e2e;
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 16px;
+                padding: 32px;
+                max-width: 400px;
+                text-align: center;
+            }}
+            .modal h3 {{
+                font-size: 20px;
+                margin-bottom: 12px;
+            }}
+            .modal p {{
+                color: #a1a1aa;
+                margin-bottom: 24px;
+            }}
+            .modal-buttons {{
+                display: flex;
+                gap: 12px;
+                justify-content: center;
+            }}
+
+            /* Responsive */
+            @media (max-width: 640px) {{
+                .container {{ padding: 16px; }}
+                header {{ flex-direction: column; align-items: flex-start; }}
+                .memory-meta {{ grid-template-columns: 1fr; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <div class="logo">
+                    <span class="logo-icon">🧠</span>
+                    <h1>SimpleMem</h1>
+                </div>
+                <nav>
+                    <a href="/">Status</a>
+                    <a href="/memories" class="active">Memories</a>
+                    <a href="/api/health">API Health</a>
+                </nav>
+            </header>
+
+            <div class="stats-bar">
+                <div class="stat-card">
+                    <div class="stat-value">{entry_count}</div>
+                    <div class="stat-label">Total Memories</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{settings.s3_bucket}</div>
+                    <div class="stat-label">S3 Bucket</div>
+                </div>
+                <div class="stat-card status">
+                    <div class="stat-value">{"● Connected" if s3_ok else "● Disconnected"}</div>
+                    <div class="stat-label">Storage Status</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value small">{settings.llm_model}</div>
+                    <div class="stat-label">LLM Model</div>
+                    <div class="stat-sublabel">Memory extraction & answers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value small">{settings.embedding_model}</div>
+                    <div class="stat-label">Embedding Model</div>
+                    <div class="stat-sublabel">Vector indexing & search</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{settings.embedding_dimension}</div>
+                    <div class="stat-label">Vector Dimension</div>
+                </div>
+            </div>
+
+            <div class="controls">
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="Search memories..." onkeyup="filterMemories()">
+                </div>
+                <select id="topicFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Topics</option>
+                    {''.join(f'<option value="{t}">{t}</option>' for t in sorted(all_topics))}
+                </select>
+                <select id="personFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Persons</option>
+                    {''.join(f'<option value="{p}">{p}</option>' for p in sorted(all_persons))}
+                </select>
+                <select id="entityFilter" class="filter-select" onchange="filterMemories()">
+                    <option value="">All Entities</option>
+                    {''.join(f'<option value="{e}">{e}</option>' for e in sorted(all_entities))}
+                </select>
+                <button class="btn btn-secondary" onclick="clearFilters()">
+                    Clear Filters
+                </button>
+            </div>
+
+            <div class="selection-controls">
+                <label class="select-all-label">
+                    <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+                    Select All Visible
+                </label>
+                <span id="selectionCount" class="selection-count">0 selected</span>
+                <button class="btn btn-danger" id="deleteSelectedBtn" onclick="showDeleteSelectedModal()" disabled>
+                    🗑 Delete Selected
+                </button>
+                <button class="btn btn-primary" onclick="location.reload()">
+                    ↻ Refresh
+                </button>
+                <button class="btn btn-danger" onclick="showClearModal()">
+                    🗑 Clear All
+                </button>
+            </div>
+
+            <div class="memory-grid" id="memoryGrid">
+                {memory_cards}
+            </div>
+
+            <footer>
+                <p>SimpleMem v1.0.0 · <a href="https://aiming-lab.github.io/SimpleMem-Page/" target="_blank">Documentation</a></p>
+            </footer>
+        </div>
+
+        <!-- Clear Confirmation Modal -->
+        <div class="modal-overlay" id="clearModal">
+            <div class="modal">
+                <h3>⚠️ Clear All Memories?</h3>
+                <p>This action cannot be undone. All {entry_count} memories will be permanently deleted.</p>
+                <div class="modal-buttons">
+                    <button class="btn btn-primary" onclick="hideClearModal()">Cancel</button>
+                    <button class="btn btn-danger" onclick="clearAllMemories()">Delete All</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Delete Selected Confirmation Modal -->
+        <div class="modal-overlay" id="deleteSelectedModal">
+            <div class="modal">
+                <h3>⚠️ Delete Selected Memories?</h3>
+                <p id="deleteSelectedCount">This action cannot be undone.</p>
+                <div class="modal-buttons">
+                    <button class="btn btn-primary" onclick="hideDeleteSelectedModal()">Cancel</button>
+                    <button class="btn btn-danger" onclick="deleteSelectedMemories()">Delete Selected</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            // Filter memories by text search and dropdown filters
+            function filterMemories() {{
+                const query = document.getElementById('searchInput').value.toLowerCase();
+                const topicFilter = document.getElementById('topicFilter').value;
+                const personFilter = document.getElementById('personFilter').value;
+                const entityFilter = document.getElementById('entityFilter').value;
+                const cards = document.querySelectorAll('.memory-card');
+
+                cards.forEach(card => {{
+                    const content = card.textContent.toLowerCase();
+                    const topic = card.dataset.topic || '';
+                    const persons = JSON.parse(card.dataset.persons || '[]');
+                    const entities = JSON.parse(card.dataset.entities || '[]');
+
+                    // Check text search
+                    const matchesText = !query || content.includes(query);
+
+                    // Check topic filter
+                    const matchesTopic = !topicFilter || topic === topicFilter;
+
+                    // Check person filter
+                    const matchesPerson = !personFilter || persons.includes(personFilter);
+
+                    // Check entity filter
+                    const matchesEntity = !entityFilter || entities.includes(entityFilter);
+
+                    // Show if all filters match
+                    card.style.display = (matchesText && matchesTopic && matchesPerson && matchesEntity) ? 'block' : 'none';
+                }});
+
+                // Update select all checkbox state
+                updateSelectAllState();
+            }}
+
+            function clearFilters() {{
+                document.getElementById('searchInput').value = '';
+                document.getElementById('topicFilter').value = '';
+                document.getElementById('personFilter').value = '';
+                document.getElementById('entityFilter').value = '';
+                filterMemories();
+            }}
+
+            // Selection functions
+            function toggleSelectAll() {{
+                const selectAll = document.getElementById('selectAll').checked;
+                const visibleCards = document.querySelectorAll('.memory-card[style="display: block"], .memory-card:not([style*="display"])');
+
+                visibleCards.forEach(card => {{
+                    if (card.style.display !== 'none') {{
+                        const checkbox = card.querySelector('.memory-checkbox');
+                        if (checkbox) {{
+                            checkbox.checked = selectAll;
+                            card.classList.toggle('selected', selectAll);
+                        }}
+                    }}
+                }});
+
+                updateSelectionCount();
+            }}
+
+            function updateSelectAllState() {{
+                const visibleCheckboxes = [];
+                document.querySelectorAll('.memory-card').forEach(card => {{
+                    if (card.style.display !== 'none') {{
+                        const checkbox = card.querySelector('.memory-checkbox');
+                        if (checkbox) visibleCheckboxes.push(checkbox);
+                    }}
+                }});
+
+                const allChecked = visibleCheckboxes.length > 0 && visibleCheckboxes.every(cb => cb.checked);
+                document.getElementById('selectAll').checked = allChecked;
+            }}
+
+            function updateSelectionCount() {{
+                const selected = document.querySelectorAll('.memory-checkbox:checked');
+                const count = selected.length;
+                document.getElementById('selectionCount').textContent = count + ' selected';
+
+                const deleteBtn = document.getElementById('deleteSelectedBtn');
+                deleteBtn.disabled = count === 0;
+
+                // Update card styling
+                document.querySelectorAll('.memory-card').forEach(card => {{
+                    const checkbox = card.querySelector('.memory-checkbox');
+                    card.classList.toggle('selected', checkbox && checkbox.checked);
+                }});
+
+                updateSelectAllState();
+            }}
+
+            // Modal functions
+            function showClearModal() {{
+                document.getElementById('clearModal').classList.add('active');
+            }}
+
+            function hideClearModal() {{
+                document.getElementById('clearModal').classList.remove('active');
+            }}
+
+            function showDeleteSelectedModal() {{
+                const count = document.querySelectorAll('.memory-checkbox:checked').length;
+                document.getElementById('deleteSelectedCount').textContent =
+                    'This action cannot be undone. ' + count + ' memor' + (count === 1 ? 'y' : 'ies') + ' will be permanently deleted.';
+                document.getElementById('deleteSelectedModal').classList.add('active');
+            }}
+
+            function hideDeleteSelectedModal() {{
+                document.getElementById('deleteSelectedModal').classList.remove('active');
+            }}
+
+            async function clearAllMemories() {{
+                try {{
+                    // Initialize session first
+                    const initRes = await fetch('/mcp', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        }},
+                        body: JSON.stringify({{
+                            jsonrpc: '2.0',
+                            method: 'initialize',
+                            id: 1,
+                            params: {{}}
+                        }})
+                    }});
+                    const sessionId = initRes.headers.get('Mcp-Session-Id');
+
+                    // Call clear tool
+                    await fetch('/mcp', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'Mcp-Session-Id': sessionId
+                        }},
+                        body: JSON.stringify({{
+                            jsonrpc: '2.0',
+                            method: 'tools/call',
+                            id: 2,
+                            params: {{
+                                name: 'memory_clear',
+                                arguments: {{}}
+                            }}
+                        }})
+                    }});
+
+                    location.reload();
+                }} catch (err) {{
+                    alert('Error clearing memories: ' + err.message);
+                }}
+            }}
+
+            async function deleteSelectedMemories() {{
+                try {{
+                    const selectedCheckboxes = document.querySelectorAll('.memory-checkbox:checked');
+                    const entryIds = Array.from(selectedCheckboxes).map(cb => cb.dataset.entryId);
+
+                    if (entryIds.length === 0) {{
+                        hideDeleteSelectedModal();
+                        return;
+                    }}
+
+                    const response = await fetch('/api/memories/delete', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json'
+                        }},
+                        body: JSON.stringify({{ entry_ids: entryIds }})
+                    }});
+
+                    const result = await response.json();
+
+                    if (result.success) {{
+                        location.reload();
+                    }} else {{
+                        alert('Error deleting memories: ' + (result.error || 'Unknown error'));
+                        hideDeleteSelectedModal();
+                    }}
+                }} catch (err) {{
+                    alert('Error deleting memories: ' + err.message);
+                    hideDeleteSelectedModal();
+                }}
+            }}
+
+            // Close modals on escape key
+            document.addEventListener('keydown', (e) => {{
+                if (e.key === 'Escape') {{
+                    hideClearModal();
+                    hideDeleteSelectedModal();
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    '''
+    return HTMLResponse(content=page_html)
+
+
+# === API Endpoint for Memory Data (JSON) ===
+
+@app.get("/api/memories")
+async def get_memories_api():
+    """Get all memories as JSON for programmatic access"""
+    try:
+        entries = await vector_store.get_all_entries()
+        return {
+            "success": True,
+            "count": len(entries),
+            "memories": [
+                {
+                    "content": e.lossless_restatement,
+                    "timestamp": e.timestamp,
+                    "location": e.location,
+                    "persons": e.persons,
+                    "entities": e.entities,
+                    "topic": e.topic,
+                }
+                for e in entries
+            ]
+        }
+    except Exception as ex:
+        return {"success": False, "error": str(ex), "memories": []}
+
+
+@app.post("/api/memories/delete")
+async def delete_memories_api(request: Request):
+    """Delete specific memories by their entry IDs
+
+    Note: No auth required - consistent with /memories viewer page.
+    The Memory Viewer is an internal admin tool.
     """
-    Legacy MCP over Server-Sent Events (SSE) endpoint.
+    try:
+        body = await request.json()
+        entry_ids = body.get("entry_ids", [])
 
-    DEPRECATED: Use Streamable HTTP at /mcp instead.
+        if not entry_ids:
+            return {"success": False, "error": "No entry_ids provided", "deleted": 0}
 
-    Supports both:
-    - Query param: ?token=<token> (legacy)
-    - Header: Authorization: Bearer <token> (preferred)
-    """
-    # Try to get token from header first, then query param
-    if authorization:
-        user, api_key = await verify_bearer_token(authorization)
-    elif token:
-        is_valid, payload, error = token_manager.verify_token(token)
-        if not is_valid:
-            raise HTTPException(status_code=401, detail=error)
-        user = user_store.get_user(payload.user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-    else:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    # Create session for legacy client
-    session = await get_or_create_session(user, api_key)
-
-    # Get base URL
-    base_url = os.getenv("MCP_BASE_URL", "")
-    message_endpoint = f"{base_url}/mcp/message" if base_url else "/mcp/message"
-
-    async def event_generator():
-        """Generate SSE events"""
-        # Send endpoint info as first event (legacy format)
-        endpoint_url = f"{message_endpoint}?session_id={session.session_id}"
-        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
-
-        # Send initial keepalive
-        yield ": keepalive\n\n"
-
-        # Keep connection alive
-        while True:
-            await asyncio.sleep(15)
-            yield ": keepalive\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+        deleted_count = await vector_store.delete_entries(entry_ids)
+        return {"success": True, "deleted": deleted_count}
+    except Exception as ex:
+        return {"success": False, "error": str(ex), "deleted": 0}
 
 
-@app.post("/mcp/message")
-async def mcp_message_endpoint_legacy(
-    request: Request,
-    session_id: Optional[str] = Query(None, description="Session ID"),
-    token: Optional[str] = Query(None, description="Authentication token (legacy)"),
-    authorization: Optional[str] = Header(None),
-    mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
-):
-    """
-    Legacy MCP message endpoint.
-
-    DEPRECATED: Use Streamable HTTP POST to /mcp instead.
-
-    Supports both legacy and new authentication methods.
-    """
-    # Get session ID from header or query param
-    sid = mcp_session_id or session_id
-
-    # Try to authenticate and get session
-    if authorization:
-        user, api_key = await verify_bearer_token(authorization)
-        if sid:
-            session = await get_session(sid)
-            if session and session.user_id == user.user_id:
-                handler = session.handler
-            else:
-                handler = _get_mcp_handler(user, api_key)
-        else:
-            handler = _get_mcp_handler(user, api_key)
-    elif token:
-        is_valid, payload, error = token_manager.verify_token(token)
-        if not is_valid:
-            raise HTTPException(status_code=401, detail=error)
-        user = user_store.get_user(payload.user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
-        handler = _get_mcp_handler(user, api_key)
-    elif sid:
-        # Try to get session by ID
-        session = await get_session(sid)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        handler = session.handler
-        user = session.user
-    else:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    user_store.update_last_active(user.user_id)
-
-    # Process message
-    body = await request.body()
-    response = await handler.handle_message(body.decode("utf-8"))
-
-    return json.loads(response)
-
-
-# === Static Files (Frontend) ===
-
-frontend_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
-if os.path.exists(frontend_path):
-    app.mount("/static", StaticFiles(directory=frontend_path), name="static")
-
+# === Root Endpoint (Single-Tenant Status Page) ===
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
-    """Serve frontend HTML"""
-    index_path = os.path.join(frontend_path, "index.html")
-    if os.path.exists(index_path):
-        with open(index_path, "r") as f:
-            return HTMLResponse(content=f.read())
-    return HTMLResponse(content="<h1>SimpleMem MCP Server</h1><p>Frontend not found.</p>")
+async def root_status():
+    """Show server status page (single-tenant mode)"""
+    s3_ok, _ = vector_store.test_connection()
+    status_color = "#22c55e" if s3_ok else "#ef4444"
+
+    page_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>SimpleMem MCP Server</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }}
+            h1 {{ color: #1f2937; }}
+            .status {{ display: inline-block; padding: 4px 12px; border-radius: 4px; background: {status_color}; color: white; }}
+            .info {{ background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0; }}
+            code {{ background: #e5e7eb; padding: 2px 6px; border-radius: 4px; }}
+        </style>
+    </head>
+    <body>
+        <h1>SimpleMem MCP Server</h1>
+        <p>Efficient Lifelong Memory for LLM Agents</p>
+        <p>Status: <span class="status">{"Running" if s3_ok else "Degraded"}</span></p>
+
+        <div class="info">
+            <p><strong>Mode:</strong> Single-Tenant</p>
+            <p><strong>Storage:</strong> S3 ({settings.s3_bucket})</p>
+            <p><strong>Auth:</strong> {"Enabled" if auth_manager.auth_enabled else "Disabled"}</p>
+            <p><strong>MCP Endpoint:</strong> <code>POST /mcp</code></p>
+        </div>
+
+        <h3>Quick Test</h3>
+        <pre style="background: #1f2937; color: #f3f4f6; padding: 15px; border-radius: 8px; overflow-x: auto;">
+curl -X POST {settings.mcp_base_url or 'http://localhost:' + str(settings.port)}/mcp \\
+  -H "Content-Type: application/json" \\
+  -H "Accept: application/json" \\
+  -d '{{"jsonrpc":"2.0","method":"initialize","id":1,"params":{{}}}}'</pre>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=page_html)
 
 
 # === Entry Point ===
@@ -796,3 +1467,25 @@ def run_server(host: str = "0.0.0.0", port: int = 8000):
 
 if __name__ == "__main__":
     run_server()
+
+
+# =============================================================================
+# MULTI-TENANT HTTP SERVER CODE (PRESERVED FOR REFERENCE)
+# See multi-tenant-backup branch for original implementation
+# =============================================================================
+#
+# Key differences in multi-tenant mode:
+# - User registration endpoint (/api/auth/register)
+# - JWT token generation and verification
+# - Per-user table isolation in LanceDB
+# - UserStore for SQLite user metadata
+# - OpenRouterClientManager for per-user API keys
+# - Session management with user_id validation
+#
+# Removed endpoints:
+# - POST /api/auth/register - User registration with OpenRouter API key
+# - GET /api/auth/verify - Token verification
+# - POST /api/auth/refresh - Token refresh
+# - GET /mcp/sse - Legacy SSE endpoint
+# - POST /mcp/message - Legacy message endpoint
+# =============================================================================

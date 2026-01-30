@@ -1,6 +1,6 @@
 """Authentication module for SimpleMem MCP Server"""
 
-from .token_manager import TokenManager
-from .models import User, TokenPayload
+from .token_manager import SimpleAuthManager
+from .models import MemoryEntry, Dialogue
 
-__all__ = ["TokenManager", "User", "TokenPayload"]
+__all__ = ["SimpleAuthManager", "MemoryEntry", "Dialogue"]

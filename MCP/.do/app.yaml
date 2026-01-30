@@ -1,0 +1,93 @@
+# DigitalOcean App Platform Configuration
+# SimpleMem MCP Server - Single-Tenant Mode
+#
+# Deploy via:
+#   1. Connect your GitHub repo in DigitalOcean App Platform
+#   2. Select the MCP directory as the source
+#   3. Configure environment variables in App Platform settings
+#   4. Deploy
+
+name: simplemem-mcp
+region: nyc
+
+services:
+  - name: simplemem-server
+    # Source directory within repo (contains Dockerfile)
+    source_dir: MCP
+
+    # Dockerfile path relative to source_dir
+    dockerfile_path: Dockerfile
+
+    # Instance configuration
+    instance_count: 1
+    instance_size_slug: basic-xxs
+
+    # HTTP configuration
+    http_port: 8000
+
+    # Health check
+    health_check:
+      http_path: /api/health
+      initial_delay_seconds: 10
+      period_seconds: 10
+      timeout_seconds: 3
+      success_threshold: 1
+      failure_threshold: 3
+
+    # Environment variables
+    # Configure SECRET values in App Platform UI, not here
+    envs:
+      # Required: OpenRouter API Key
+      - key: OPENROUTER_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      # Required: S3/Spaces Configuration
+      - key: S3_BUCKET
+        scope: RUN_TIME
+        type: SECRET
+
+      - key: S3_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      - key: S3_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      - key: S3_ENDPOINT
+        value: https://nyc3.digitaloceanspaces.com
+        scope: RUN_TIME
+        type: GENERAL
+
+      - key: S3_REGION
+        value: nyc3
+        scope: RUN_TIME
+        type: GENERAL
+
+      # Optional: Client Authentication
+      - key: SIMPLEMEM_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      # Server Configuration
+      - key: PORT
+        value: "8000"
+        scope: RUN_TIME
+        type: GENERAL
+
+      - key: DEBUG
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+
+      # Model Configuration
+      - key: LLM_MODEL
+        value: openai/gpt-4.1-mini
+        scope: RUN_TIME
+        type: GENERAL
+
+      - key: EMBEDDING_MODEL
+        value: qwen/qwen3-embedding-4b
+        scope: RUN_TIME
+        type: GENERAL
